@@ -1,7 +1,5 @@
 # Biomarkers_for_Peri-Implantitis
-Pipeline for the proteomic analysis of crevicular fluid for the identification of biomarker panels for diagnostics of peri-implantitis
-
-## Overview
-This repository contains the data analysis pipeline for the manuscript <br/>
-**Proteomics of crevicular fluid identifies biomarker panels for non-invasice diagnostics of peri-implantitis**
+This repository contains the data analysis pipeline for the proteomic analysis of crevicular fluid for the identification of biomarker panels for diagnostics of peri-implantitis. Three cohorts of patients with peri-implantitis-affected implants, healthy implants, and healthy teeth were processed. <br/>
+<br/>
+Here you find the rmd files for the analysis of the discovery, validation and external validation cohorts, and for the identification and validation of biomarker panels using classification models. 
 
