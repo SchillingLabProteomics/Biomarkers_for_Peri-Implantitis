@@ -1,0 +1,1219 @@
+### Integration of the Discovery, Validation and External Validation Cohorts ###
+#by AT
+
+#load libraries
+```{r}
+library(devtools)
+library(diann)
+library(tidyverse)
+library(ggplot2)
+library(ggrepel)
+library(ggpubr)
+library(dplyr)
+library(tidyr)
+library(visdat)
+library("readxl")
+library(RColorBrewer)
+library(mixOmics)
+library(limma)
+library(clusterProfiler)
+library(enrichplot)
+library(org.Hs.eg.db)
+library("ComplexHeatmap")
+library(colorRamp2)
+library(HarmonizR)
+library(genefilter)
+library(edgeR)
+library(sva)
+library(arrow)
+library(UniprotR)
+library(ggvenn)
+library(TOSTER)
+library(broom)
+library(umap)
+library(vegan)
+library(gtsummary)
+library(xgboost)
+library(caret)
+library(pROC)
+library(ROCR)
+library(ROSE)
+library(dplyr)
+library(rBayesianOptimization)
+library(parallel)
+library(doParallel)
+```
+#colors and ggplot theme
+```{r}
+new_colors <- list(
+  values = c("IK" = "#c44826", "IG" = "#5d7034", "ZG" = "#7da4b7"),
+  labels = c("IK" = "peri-implantitis", "IG" = "healthy implant", "ZG" = "healthy tooth")
+)
+
+
+theme_manuscript <- theme(
+        axis.text = element_text(size = 10, color = "black"),
+        axis.title.x = element_text(size = 10, color = "black", face = "bold", margin = margin(t = 0)),
+        axis.title.y = element_text(size = 10, color = "black", face = "bold", margin = margin(r = 0)),
+        strip.text = element_text(size = 10, color = "black", face = "bold"),
+        strip.background = element_rect(fill = "white"),
+        legend.text = element_text(size = 10, color = "black"),
+        legend.title = element_blank(),
+        panel.background = element_blank(),
+        panel.grid.major = element_line(color = "white"),
+        panel.border = element_rect(colour = "black", 
+                                    fill = NA, 
+                                    linewidth = 1),
+        legend.spacing.y = unit(0.5, "cm"),
+        legend.position = "none")
+```
+#load data
+```{r}
+prot_mat_disc <- read.csv("prot_mat_fil_discovery.csv", row.names = 1)
+prot_mat_val <- read.csv("prot_mat_fil_validation.csv", row.names = 1)
+prot_mat_exval <- read.csv("prot_mat_fil_external_validation.csv", row.names = 1)
+
+
+annot_disc <- read.csv("annot_data_fil_discovery.csv", row.names = 1)
+annot_val <- read.csv("annot_data_fil_validation.csv", row.names = 1)
+annot_exval <- read.csv("annot_data_fil_external_validation.csv", row.names = 1)
+
+best_params_disc <- read.csv("best_params_discovery_cohort.csv") 
+best_params_disc <- best_params_disc[,-1]
+best_params_disc <- as.list(best_params_disc)
+
+best_params_val <- read.csv("best_params_validation_cohort.csv") 
+best_params_val <- best_params_val[,-1]
+best_params_val <- as.list(best_params_val)
+
+best_params_exval <- read.csv("best_params_external_validation_cohort.csv") 
+best_params_exval <- best_params_exval[,-1]
+best_params_exval <- as.list(best_params_exval)
+
+overlap_08prots <- read.csv("overlap_08prots.csv", row.names = 1)
+overlap_08prots <- overlap_08prots$x
+```
+#make panel combinations - 1x up and 1x down
+```{r}
+#generate all combinations of 2 Protein.Group entries
+combinations <- combn(overlap_08prots, 2)
+
+#define a function to check the logFC condition
+check_logFC <- function(comb, df) {
+  logFC_values <- df$logFC[df$Protein.Group %in% comb]
+  any(logFC_values > 0) && any(logFC_values < 0)
+}
+
+#load limma from discovery cohort
+limma_disc <- read.csv("limma_IK_IG_ZG_discovery_cohort.csv", row.names = 1)
+
+limma_disc_mod <- limma_disc %>%
+  filter(Contrast == "IKvIG") %>%
+  mutate(Protein.Group = sub(";.*", "", limma_disc$Protein.Group[limma_disc$Contrast == "IKvIG"]))
+
+# Filter combinations based on the logFC condition
+valid_combinations <- apply(combinations, 2, function(comb) {
+  if (check_logFC(comb, limma_disc_mod)) {
+    return(comb)
+  } else {
+    return(NULL)
+  }
+})
+
+# Remove NULL values and save as a list of vectors
+valid_combinations <- Filter(Negate(is.null), valid_combinations)
+valid_combinations <- lapply(valid_combinations, as.vector)
+
+#975 combinations (2-protein-panel) #80 overlap proteins
+```
+#prepare matrices for classification model training
+```{r}
+#make it a function 
+prepare_matrix <- function(prot_mat_fil_sparsred, annot_data_fil){
+  #transpose protein matrix after sample filtering but without normalization/scaling
+  classifier_mat <- as.data.frame(t(prot_mat_fil_sparsred))
+
+  classifier_mat <- classifier_mat %>%
+    rownames_to_column("sample_id")
+
+  classifier_mat$type <- annot_data_fil$type
+
+  #remove all ZG samples
+  classifier_mat <- classifier_mat %>%
+    filter(type != "ZG") %>%
+    column_to_rownames("sample_id")
+
+  classifier_mat$type <- factor(classifier_mat$type, levels = c("IG", "IK"))
+
+  #need to remove the ; in the column names of the classifier_mat3
+  cols_mat <- colnames(classifier_mat)
+  cols_mat_mod <- sub(";.*", "", cols_mat)
+
+  classifier_mat_mod <- classifier_mat
+  colnames(classifier_mat_mod) <- cols_mat_mod
+  
+  return(classifier_mat_mod)
+}
+
+classifier_mat_disc <- prepare_matrix(prot_mat_disc, annot_disc)
+classifier_mat_val <- prepare_matrix(prot_mat_val, annot_val)
+classifier_mat_exval <- prepare_matrix(prot_mat_exval, annot_exval)
+
+
+#selection of features
+prots_selection_mod <- sub(";.*", "", overlap_08prots)
+```
+#model training - functions
+```{r}
+#functions I need
+prep_df <- function(classifier_mat, prots_selection){
+  data_t <- classifier_mat[,colnames(classifier_mat) %in% prots_selection]
+  data_t$type <- classifier_mat$type
+  data_t$type <- factor(data_t$type, levels = c("IG", "IK"))
+  return(data_t)
+}
+
+
+#bayesian optimization with 5-fold cross-validation
+xgb_cv_bayes <- function(eta, max_depth, subsample, colsample_bytree, min_child_weight, gamma, alpha, lambda) {
+  
+  tryCatch({
+    dtrain <- xgb.DMatrix(data = as.matrix(training[, -ncol(training)]), 
+                          label = as.numeric(training$type) - 1)
+    
+    params <- list(
+      booster = "gbtree",
+      objective = "binary:logistic",
+      eval_metric = "auc",
+      eta = eta,
+      max_depth = max_depth,
+      subsample = subsample,
+      colsample_bytree = colsample_bytree,
+      min_child_weight = min_child_weight,
+      gamma = gamma,
+      alpha = alpha,
+      lambda = lambda
+    )
+    
+    cv_result <- xgb.cv(
+      params = params,
+      data = dtrain,
+      nrounds = 1000,
+      nfold = 5,
+      early_stopping_rounds = 50,
+      verbose = 0,
+      nthread = 20,
+      stratified = TRUE
+    )
+    
+    score <- max(cv_result$evaluation_log$test_auc_mean, na.rm = TRUE)  # Ensure no NA values in the score
+    
+    return(list(Score = score, Pred = 0))
+    
+  }, error = function(e) {
+    message("Error during optimization step: ", e)  # Print the error message
+    return(list(Score = 0.5, Pred = 0))  # Assign a low score if an error occurs
+  })
+}
+
+#bayesian optimization function
+tune_xgboost_bayes <- function(training) {
+  set.seed(1234)
+  opt_res <- BayesianOptimization(
+    FUN = xgb_cv_bayes,
+    bounds = list(
+      eta = c(0.001, 0.2),
+      max_depth = c(2L, 4L),
+      subsample = c(0.8, 1.0),   
+      colsample_bytree = c(0.8, 1),
+      min_child_weight = c(2L, 10L),
+      gamma = c(0, 2), #bis 2 
+      alpha = c(0, 1),
+      lambda = c(1, 10) #bis 10 
+    ),
+    init_points = 5,
+    n_iter = 20,
+    acq = "ucb",
+    kappa = 2.576,
+    verbose = TRUE
+  )
+  
+  #extract the best hyperparameters
+  best_params <- list(
+    booster = "gbtree",
+    objective = "binary:logistic",
+    eval_metric = "auc",
+    eta = opt_res$Best_Par["eta"],
+    max_depth = as.integer(opt_res$Best_Par["max_depth"]),
+    subsample = opt_res$Best_Par["subsample"],
+    colsample_bytree = opt_res$Best_Par["colsample_bytree"],
+    min_child_weight = as.integer(opt_res$Best_Par["min_child_weight"]),
+    gamma = opt_res$Best_Par["gamma"],
+    alpha = opt_res$Best_Par["alpha"],
+    lambda = opt_res$Best_Par["lambda"],
+    nthread = 96
+  )
+  
+  return(best_params)
+}
+
+
+#train XGBoost model without early stopping
+train_xgboost_model <- function(training, params) {
+  #prepare the training data
+  dtrain <- xgb.DMatrix(data = as.matrix(training[, -ncol(training)]), 
+                        label = as.numeric(training$type) - 1)
+  
+  #train the model without early stopping and no validation set
+  model <- xgb.train(
+    params = params,
+    data = dtrain,
+    nrounds = 1000,  # The number of boosting rounds
+    verbose = 1  # Verbosity level
+  )
+  
+  return(model)
+}
+
+
+#evaluate model function
+evaluate_model <- function(model, test_data, prots_selection) {
+  #convert test data to DMatrix format for XGBoost
+  dtest <- xgb.DMatrix(data = as.matrix(test_data[, -ncol(test_data)]))
+  
+  #get predicted probabilities
+  pred_probs <- predict(model, dtest)
+  
+  #ensure that the length of predictions matches the number of actual labels
+  if (length(pred_probs) != nrow(test_data)) {
+    stop("Number of predictions does not match the number of rows in test_data.")
+  }
+  
+  #compute ROC to get the best threshold using Youden's index
+  roc_obj <- roc(response = as.numeric(test_data$type) - 1, predictor = pred_probs)
+  best_threshold <- coords(roc_obj, "best", ret = "threshold", best.method = "youden")
+  best_threshold <- best_threshold[1,1]
+  
+  #classify based on best threshold
+  pred_class <- ifelse(pred_probs > best_threshold, "IK", "IG")
+  
+  #convert predictions to factor with the same levels as test_data$type
+  pred_class <- factor(pred_class, levels = levels(test_data$type))
+  
+  #ensure that pred_class and test_data$type have the same length
+  if (length(pred_class) != length(test_data$type)) {
+    stop("The length of predicted classes does not match the actual classes.")
+  }
+  
+  #create confusion matrix
+  conf_matrix <- confusionMatrix(pred_class, test_data$type, positive = "IK")
+  
+  #return evaluation metrics
+  return(list(
+    Proteins = length(prots_selection),
+    Acc = conf_matrix$overall["Accuracy"],
+    Sens = conf_matrix$byClass["Sensitivity"],
+    Spec = conf_matrix$byClass["Specificity"],
+    AUC = auc(roc_obj),
+    Best_Threshold = best_threshold,
+    prots_selection = paste(prots_selection, collapse = ",")
+  ))
+}
+
+```
+#train classifiers on all panels - discovery and validation cohort
+```{r}
+#discovery cohort
+
+#make an empty list to store the results
+panel_results_disc <- list()
+
+#loop through each valid combination and execute the make_model function
+for (i in seq_along(valid_combinations)) {
+  
+  print(length(panel_results_disc))
+  comb <- valid_combinations[[i]]
+  
+  #prepare data
+  dataML <- prep_df(classifier_mat_disc, comb)
+
+  #split data into training and testing (no need for validation set)
+  set.seed(1234)
+  inTrain <- createDataPartition(y = dataML$type, p = 0.70, list = FALSE)
+  training <- dataML[inTrain,]
+  testing <- dataML[-inTrain,]
+
+  #train the final model with the best hyperparameters
+  xgb_model <- train_xgboost_model(training, best_params_disc)
+
+  #evaluate the model on the test data
+  result <- evaluate_model(xgb_model, testing, comb)
+  
+  panel_results_disc[[i]] <- result
+
+}
+
+panel_results_disc <- do.call(rbind, lapply(panel_results_disc, as.data.frame))
+
+
+#same for validation cohort
+
+#make an empty list to store the results
+panel_results_val <- list()
+
+#loop through each valid combination and execute the make_model function
+for (i in seq_along(valid_combinations)) {
+  
+  print(length(panel_results_val))
+  comb <- valid_combinations[[i]]
+  
+  #prepare data
+  dataML <- prep_df(classifier_mat_val, comb)
+
+  #split data into training and testing (no need for validation set)
+  set.seed(1234)
+  inTrain <- createDataPartition(y = dataML$type, p = 0.70, list = FALSE)
+  training <- dataML[inTrain,]
+  testing <- dataML[-inTrain,]
+
+  #train the final model with the best hyperparameters
+  xgb_model <- train_xgboost_model(training, best_params_val)
+
+  #evaluate the model on the test data
+  result <- evaluate_model(xgb_model, testing, comb)
+  
+  panel_results_val[[i]] <- result
+
+}
+
+panel_results_val <- do.call(rbind, lapply(panel_results_val, as.data.frame))
+```
+#overlap of panels 
+```{r}
+panel_results_disc <- panel_results_disc %>%
+  mutate(above90 = ifelse(round(AUC, digits = 2) >= 0.90, "yes", "no"))
+
+panel_results_val <- panel_results_val %>%
+  mutate(above90 = ifelse(round(AUC, digits = 2) >= 0.90, "yes", "no"))
+
+panel_selection <- intersect(panel_results_disc[panel_results_disc$above90 == "yes",]$prots_selection,
+                            panel_results_val[panel_results_val$above90 == "yes",]$prots_selection)
+#51 panels with AUC >= 0.90 in both  
+
+panel_selection_info <- data.frame(panel = panel_selection)
+
+panel_selection_info <- panel_selection_info %>%
+  mutate(prot1 = sub(",.*", "", panel)) %>%
+  mutate(prot2 = sub(".*,", "", panel))
+
+prot2gene <- read.csv("prot2gene.csv", row.names = 1)
+
+panel_selection_info <- left_join(panel_selection_info, prot2gene, by = c("prot1" = "Protein.Group"))
+colnames(panel_selection_info)[4] <- "gene1"
+
+panel_selection_info <- left_join(panel_selection_info, prot2gene, by = c("prot2" = "Protein.Group"))
+colnames(panel_selection_info)[5] <- "gene2"
+
+#get ROC and AUC data for these and plot together
+
+#discovery cohort
+roc_df_list_disc <- list()
+auc_values_disc <- c()
+
+#now loop
+for (panel in panel_selection) {
+  print(length(auc_values_disc)+1)
+  
+  #split the panel into a vector of ids
+  comb <- unlist(strsplit(panel, ","))
+  
+  #prepare data
+  dataML <- prep_df(classifier_mat_disc, comb)
+
+  #split data into training and testing (no need for validation set)
+  set.seed(1234)
+  inTrain <- createDataPartition(y = dataML$type, p = 0.70, list = FALSE)
+  training <- dataML[inTrain,]
+  testing <- dataML[-inTrain,]
+
+  #train the final model with the best hyperparameters
+  xgb_model <- train_xgboost_model(training, best_params_disc)
+ 
+  #evaluate the model on the test data - same code as in evaluate_model() function
+  #convert test data to DMatrix format for XGBoost
+  dtest <- xgb.DMatrix(data = as.matrix(testing[, -ncol(testing)]))
+  
+  #get predicted probabilities
+  pred_probs <- predict(xgb_model, dtest)
+  
+  #compute ROC to get the best threshold using Youden's index
+  roc_obj <- roc(response = as.numeric(testing$type) - 1, predictor = pred_probs)
+  
+  # Create a data frame for ggplot
+  roc_data <- data.frame(
+    Sens = roc_obj[["sensitivities"]],
+    Spec = roc_obj[["specificities"]])
+  roc_data$SpecNeg <- 1- roc_data$Spec
+  roc_data <- roc_data[order(abs(roc_data$Sens), decreasing = FALSE), ]
+  auc_value <- roc_obj[["auc"]]
+  
+  #append the data frame and AUC to their respective lists
+  roc_df_list_disc[[length(roc_df_list_disc) + 1]] <- roc_data
+  auc_values_disc <- c(auc_values_disc, auc_value)
+}
+
+#add the "panel" column to each data frame in results_df_list
+for (i in seq_along(roc_df_list_disc)) {
+    roc_df_list_disc[[i]]$panel <- panel_selection[i]
+}
+
+#combine all data frames in the list into a single data frame
+roc_df_disc <- bind_rows(roc_df_list_disc)
+
+roc_df_disc$cohort <- "Discovery cohort"
+
+#create a data frame for AUC values
+auc_df_disc <- data.frame(auc = auc_values_disc)
+auc_df_disc <- auc_df_disc %>%
+  mutate(panel = panel_selection)
+
+
+
+#same with validation cohort
+roc_df_list_val <- list()
+auc_values_val <- c()
+
+#now loop
+for (panel in panel_selection) {
+  print(length(auc_values_val)+1)
+  
+  #split the panel into a vector of ids
+  comb <- unlist(strsplit(panel, ","))
+  
+  #prepare data
+  dataML <- prep_df(classifier_mat_val, comb)
+
+  #split data into training and testing (no need for validation set)
+  set.seed(1234)
+  inTrain <- createDataPartition(y = dataML$type, p = 0.70, list = FALSE)
+  training <- dataML[inTrain,]
+  testing <- dataML[-inTrain,]
+
+  #train the final model with the best hyperparameters
+  xgb_model <- train_xgboost_model(training, best_params_val)
+ 
+  #evaluate the model on the test data - same code as in evaluate_model() function
+  #convert test data to DMatrix format for XGBoost
+  dtest <- xgb.DMatrix(data = as.matrix(testing[, -ncol(testing)]))
+  
+  #get predicted probabilities
+  pred_probs <- predict(xgb_model, dtest)
+  
+  #compute ROC to get the best threshold using Youden's index
+  roc_obj <- roc(response = as.numeric(testing$type) - 1, predictor = pred_probs)
+  
+  # Create a data frame for ggplot
+  roc_data <- data.frame(
+    Sens = roc_obj[["sensitivities"]],
+    Spec = roc_obj[["specificities"]])
+  roc_data$SpecNeg <- 1- roc_data$Spec
+  roc_data <- roc_data[order(abs(roc_data$Sens), decreasing = FALSE), ]
+  auc_value <- roc_obj[["auc"]]
+  
+  #append the data frame and AUC to their respective lists
+  roc_df_list_val[[length(roc_df_list_val) + 1]] <- roc_data
+  auc_values_val <- c(auc_values_val, auc_value)
+}
+
+# Add the "panel" column to each DataFrame in results_df_list
+for (i in seq_along(roc_df_list_val)) {
+    roc_df_list_val[[i]]$panel <- panel_selection[i]
+}
+
+# Combine all data frames in the list into a single data frame
+roc_df_val <- bind_rows(roc_df_list_val)
+
+roc_df_val$cohort <- "Validation cohort"
+
+#create a data frame for AUC values
+auc_df_val <- data.frame(auc = auc_values_val)
+auc_df_val <- auc_df_val %>%
+  mutate(panel = panel_selection)
+
+#roc_df_val <- left_join(roc_df_val, auc_df_val)
+
+#colnames(roc_df_val)[6] <- "auc_val"
+
+#plot together
+roc_df_joint <- rbind(roc_df_disc, roc_df_val)
+
+roc_df_joint <- left_join(roc_df_joint, auc_df_disc)
+colnames(roc_df_joint)[6] <- "auc_disc"
+
+roc_df_joint <- left_join(roc_df_joint, auc_df_val)
+colnames(roc_df_joint)[7] <- "auc_val"
+
+roc_df_joint <- left_join(roc_df_joint, panel_selection_info)
+
+roc_df_joint$panel_genes <- paste(roc_df_joint$gene2, roc_df_joint$gene1, sep = " + ")
+
+
+ggplot(roc_df_joint, aes(x = SpecNeg, y = Sens, color = cohort)) +
+  geom_step(data = roc_df_joint %>% filter(cohort == "Validation cohort"), 
+             aes(x = SpecNeg, y = Sens, color = cohort), size = 1) + #background layer
+  geom_step(data = roc_df_joint %>% filter(cohort == "Discovery cohort"), 
+             aes(x = SpecNeg, y = Sens, color = cohort), size = 1) +    #foreground layer
+  geom_text(aes(x = 0.65, y = 0.40, label = paste("AUC =", sprintf("%.2f", auc_disc)), fontface = "bold"),
+            color = "#e39a34", size = 4) +
+  geom_text(aes(x = 0.65, y = 0.15, label = paste("AUC =", sprintf("%.2f", auc_val)), fontface = "bold"),
+            color = "#31586d", size = 4) +
+  facet_wrap(vars(panel_genes), scales = "fixed", ncol = 9) +
+  labs(x = "1 - Specificity",
+       y = "Sensitivity") +
+  scale_x_continuous(breaks = c(0, 0.5, 1)) +
+  scale_y_continuous(breaks = c(0, 0.5, 1)) +
+  theme_manuscript +
+  theme(strip.text = element_text(size = 10, color = "black", face = "plain"),
+        legend.position = "right") +
+  scale_color_manual(values = c("Discovery cohort" = "#e39a34", "Validation cohort" = "#31586d"))
+#ggsave("ROC_51panels_over_90_NEW.png", units = "cm", width = 36, height = 16, dpi = 600)
+
+```
+#proteins within 51 panels
+```{r}
+panel_selection_prots <- unique(c(panel_selection_info$prot1, panel_selection_info$prot2))
+
+#bubble plot with logFCs in discovery and validation cohort
+
+#load limma from validation cohort
+limma_val <- read.csv("limma_IK_IG_ZG_validation_cohort.csv", row.names = 1)
+
+to_dot_disc <- limma_disc %>%
+  filter(Protein.Group %in% panel_selection_prots) %>%
+  filter(Contrast == "IKvIG") %>%
+  mutate(direction = ifelse(logFC > 0, "up", "down"))
+
+to_dot_val <- limma_val %>%
+  filter(Protein.Group %in% panel_selection_prots) %>%
+  filter(Contrast == "IKvIG") %>%
+  mutate(direction = ifelse(logFC > 0, "up", "down"))
+
+
+to_dot_disc <- to_dot_disc %>%
+  mutate(cohort = "Discovery cohort")
+
+to_dot_val <- to_dot_val %>%
+  mutate(cohort = "Validation cohort")
+
+to_dot_joint <- rbind(to_dot_disc[,c(1,5,7,9,16)], to_dot_val[,c(1,5,7,9,17)])
+
+to_dot_joint$Genes <- factor(to_dot_joint$Genes,
+                             levels = c("TMPRSS11B","TACSTD2","SPINT1","SLPI","SERPINB5","RPS26","RPS23","RPL31","PAM","MMP12",
+                                        "MAL2","LPO","LAMC2","LAMA3","GRN","GALNT5","FCGBP","FAT2","ASS1","ANXA8","ALDH3A1",
+                                        "UBE2V2","SH3BGRL","PGLYRP1","PEAK3","GRB2","GMFG","GLRX","CAT"))
+
+ggplot(to_dot_joint, aes(x = logFC, y = Genes)) + 
+  geom_point(aes(color = cohort, size = -log10(adj.P.Val))) +
+  geom_vline(xintercept = 0, linetype = "solid", color = "gray20", linewidth = 0.5) +
+  labs(x = "Log2 FC", y = "", size = "-Log10\nadj. p-value", color = "") +
+  facet_wrap(. ~ cohort) +
+  theme_manuscript +
+  theme(legend.position = "right",
+        panel.grid.major.y = element_line(color = "grey80", linewidth = 0.5),
+        panel.grid.major.x = element_blank(),
+        legend.title = element_text(size = 10, color = "black")) +
+  scale_color_manual(values = c("Discovery cohort" = "#e39a34", "Validation cohort" = "#31586d"))
+
+
+#heatmap 
+
+#protein-wise z-score within each cohort separately, then join
+sample_ids_IKIG_disc <- annot_disc[annot_disc$type != "ZG",]$sample_id
+to_heat_disc <- t(scale(t(prot_mat_disc[panel_selection_prots,sample_ids_IKIG_disc]), center = TRUE, scale = TRUE))
+
+sample_ids_IKIG_val <- annot_val[annot_val$type != "ZG",]$sample_id
+to_heat_val <- t(scale(t(prot_mat_val[panel_selection_prots,sample_ids_IKIG_val]), center = TRUE, scale = TRUE))
+
+to_heat_joint <- cbind(to_heat_disc, to_heat_val)
+
+to_heat_joint <- as.data.frame(to_heat_joint) %>%
+  rownames_to_column("Protein.Group")
+
+to_heat_joint <- left_join(to_heat_joint, prot2gene)
+
+to_heat_joint <- to_heat_joint %>%
+  column_to_rownames("Genes")
+
+min(to_heat_joint[,2:length(to_heat_joint)], na.rm = T)
+max(to_heat_joint[,2:length(to_heat_joint)], na.rm = T)
+
+panel_colors <- colorRamp2(c(-4.0, -1.0, -0.5, 0, 0.5, 1.0, 4.0),
+                             c("#134688",
+                               "#74add1",  
+                               "#abd9e9",
+                               "white",
+                               "#fdae61",
+                               "#f46d43",
+                               "#a50026"))
+
+sample_ids_IG <- c(annot_disc[annot_disc$type == "IG",]$sample_id, annot_val[annot_val$type == "IG",]$sample_id)
+sample_ids_IK <- c(annot_disc[annot_disc$type == "IK",]$sample_id, annot_val[annot_val$type == "IK",]$sample_id)
+
+Condition_label_IG <- c(annot_disc[(annot_disc$sample_id %in% sample_ids_IG),]$type,
+                        annot_val[(annot_val$sample_id %in% sample_ids_IG),]$type)
+Condition_label_IG <- gsub("IG", "Healthy implant", Condition_label_IG)
+Condition_label_IK <- c(annot_disc[(annot_disc$sample_id %in% sample_ids_IK),]$type,
+                        annot_val[(annot_val$sample_id %in% sample_ids_IK),]$type)
+Condition_label_IK <- gsub("IK", "Peri-implantitis", Condition_label_IK)
+
+Cohort_label_IG <- c(rep("Discovery", nrow(annot_disc[annot_disc$sample_id %in% sample_ids_IG,])),
+                     rep("Validation", nrow(annot_val[annot_val$sample_id %in% sample_ids_IG,])))
+Cohort_label_IK <- c(rep("Discovery", nrow(annot_disc[annot_disc$sample_id %in% sample_ids_IK,])),
+                     rep("Validation", nrow(annot_val[annot_val$sample_id %in% sample_ids_IK,])))
+
+sample_annot_IK <- HeatmapAnnotation(
+  Condition = Condition_label_IK,
+  Cohort = Cohort_label_IK,
+  col = list(Condition = c("Peri-implantitis" = "#c44826", "Healthy implant" = "#5d7034"),
+             Cohort = c("Discovery" = "#e39a34", "Validation" = "#31586d")),
+  show_legend = TRUE,
+  annotation_name_gp = gpar(fontsize = 0))
+
+sample_annot_IG <- HeatmapAnnotation(
+  Condition = Condition_label_IG,
+  Cohort = Cohort_label_IG,
+  col = list(Condition = c("Peri-implantitis" = "#c44826", "Healthy implant" = "#5d7034"),
+             Cohort = c("Discovery" = "#e39a34", "Validation" = "#31586d")),
+  show_legend = TRUE,
+  annotation_name_gp = gpar(fontsize = 0))
+
+row_order <- c("TMPRSS11B","TACSTD2","SPINT1","SLPI","SERPINB5","RPS26","RPS23","RPL31","PAM","MMP12",
+              "MAL2","LPO","LAMC2","LAMA3","GRN","GALNT5","FCGBP","FAT2","ASS1","ANXA8","ALDH3A1",
+              "UBE2V2","SH3BGRL","PGLYRP1","PEAK3","GRB2","GMFG","GLRX","CAT")
+
+row_order <- match(row_order, rownames(to_heat_joint))
+row_order <- rev(row_order)
+
+heatmap_IK <- Heatmap(
+  as.matrix(to_heat_joint[,sample_ids_IK]),
+  show_row_names = TRUE,
+  show_column_names = FALSE,
+  column_names_gp = gpar(fontsize = 10, angle = 90),
+  row_names_gp = gpar(fontsize = 10),
+  row_names_side  = "left",
+  column_names_side = "top",
+  column_dend_height = unit(0.6, "cm"),
+  show_column_dend = T,
+  cluster_rows = F,
+  row_order = row_order,
+  col = panel_colors,
+  top_annotation = sample_annot_IK,
+  heatmap_legend_param = list(title = "Z-score",
+                              labels_gp = gpar(fontsize = 10)))
+
+heatmap_IG <- Heatmap(
+  as.matrix(to_heat_joint[,sample_ids_IG]),
+  show_row_names = TRUE,
+  show_column_names = FALSE,
+  column_names_gp = gpar(fontsize = 10, angle = 90),
+  row_names_gp = gpar(fontsize = 10),
+  row_names_side  = "left",
+  column_names_side = "top",
+  show_row_dend = TRUE,
+  column_dend_height = unit(0.6, "cm"),
+  show_column_dend = TRUE,
+  cluster_rows = F,
+  row_order = row_order,
+  col = panel_colors,
+  top_annotation = sample_annot_IG,
+  heatmap_legend_param = list(title = "Z-score",
+                              labels_gp = gpar(fontsize = 10)))
+
+draw(heatmap_IK + heatmap_IG)
+
+```
+
+#correlation with external validation cohort
+```{r}
+#overlap of all identified proteins (after sparsred)
+all_prots_cohort1 <- limma_disc %>%
+  filter(Contrast == "IKvIG") 
+all_prots_cohort1 <- all_prots_cohort1$Protein.Group
+#after sparsred: 3011
+
+all_prots_cohort2 <- limma_val %>%
+  filter(Contrast == "IKvIG") 
+all_prots_cohort2 <- all_prots_cohort2$Protein.Group
+#after sparsred: 4021 
+
+#load limma from validation cohort
+limma_exval <- read.csv("limma_IK_IG_ZG_external_validation_cohort.csv", row.names = 1)
+
+all_prots_cohort3 <- limma_exval %>%
+  filter(Contrast == "IKvIG") 
+all_prots_cohort3 <- all_prots_cohort3$Protein.Group
+#after sparsred: 4765
+
+all_prots_across <- intersect(all_prots_cohort1, intersect(all_prots_cohort2, all_prots_cohort3))
+#2931 across all three
+
+for_corr <- data.frame(Protein.Group = all_prots_across)
+
+for_corr <- left_join(for_corr, limma_disc[limma_disc$Contrast == "IKvIG",c(1,7)])
+colnames(for_corr)[2] <- "logFC_disc"
+
+for_corr <- left_join(for_corr, limma_val[limma_val$Contrast == "IKvIG",c(1,7)])
+colnames(for_corr)[3] <- "logFC_val"
+
+for_corr <- left_join(for_corr, limma_exval[limma_exval$Contrast == "IKvIG",c(1,7)])
+colnames(for_corr)[4] <- "logFC_exval"
+
+#calculate pearson correlation
+corr_2023_2025 <- cor(for_corr$logFC_disc, for_corr$logFC_exval, method = 'pearson')
+# R = 0.63
+corr_2024_2025 <- cor(for_corr$logFC_val, for_corr$logFC_exval, method = 'pearson')
+# R = 0.75
+
+#correlation of the 29 prots in the 51 panels
+for_corr <- for_corr %>%
+  mutate(prots29_panel = ifelse(Protein.Group %in% panel_selection_prots, "yes", "no"))
+
+corr_2023_2025_29 <- cor(for_corr$logFC_disc[for_corr$prots29_panel == "yes"],
+                         for_corr$logFC_exval[for_corr$prots29_panel == "yes"],
+                         method = 'pearson')
+# R = 0.92
+corr_2024_2025_29 <- cor(for_corr$logFC_val[for_corr$prots29_panel == "yes"],
+                         for_corr$logFC_exval[for_corr$prots29_panel == "yes"],
+                         method = 'pearson')
+# R = 0.92
+
+#colored when in the 29 prots 
+ggplot(for_corr %>% arrange(prots29_panel)) +
+  geom_hline(yintercept = 0, color = "grey40", linewidth = 0.5) +
+  geom_vline(xintercept = 0, color = "grey40", linewidth = 0.5) +
+  geom_point(aes(x = logFC_disc, y = logFC_exval, color = prots29_panel), size = 1.5, alpha = 0.9) +
+  theme_manuscript +  
+  labs(x = "Log2 FC", y = "Log2 FC") +
+  ylim(-2, 2) +
+  xlim(-2.7, 2) +
+  scale_color_manual(values = c("yes" = "#e39a34", "no" = "grey70"))
+
+ggplot(for_corr %>% arrange(prots29_panel)) +
+  geom_hline(yintercept = 0, color = "grey40", linewidth = 0.5) +
+  geom_vline(xintercept = 0, color = "grey40", linewidth = 0.5) +
+  geom_point(aes(x = logFC_val, y = logFC_exval, color = prots29_panel), size = 1.5, alpha = 0.9) +
+  theme_manuscript +  
+  labs(x = "Log2 FC", y = "Log2 FC") +
+  ylim(-2, 2) +
+  xlim(-2.7, 2) +
+  scale_color_manual(values = c("yes" = "#31586d", "no" = "grey70"))
+```
+#train 51 panels on external validation cohort
+```{r}
+#make an empty list to store the results
+panel_results_exval <- list()
+
+#loop through panels execute the make_model function
+for (i in seq_along(panel_selection)) {
+  
+  print(length(panel_results_exval)+1)
+  
+  #split the panel into a vector of ids
+  comb <- unlist(strsplit(panel_selection[i], ","))
+  
+  #prepare data
+  dataML <- prep_df(classifier_mat_exval, comb)
+
+  #split data into training and testing (no need for validation set)
+  set.seed(1234)
+  inTrain <- createDataPartition(y = dataML$type, p = 0.70, list = FALSE)
+  training <- dataML[inTrain,]
+  testing <- dataML[-inTrain,]
+
+  #train the final model with the best hyperparameters
+  xgb_model <- train_xgboost_model(training, best_params_exval)
+
+  #evaluate the model on the test data
+  result <- evaluate_model(xgb_model, testing, comb)
+  
+  panel_results_exval[[i]] <- result
+
+}
+
+panel_results_exval <- do.call(rbind, lapply(panel_results_exval, as.data.frame))
+
+panel_results_exval <- panel_results_exval %>%
+  mutate(above90 = ifelse(round(AUC, digits = 2) >= 0.90, "yes", "no"))
+
+#3 panels > 0.90 
+panel_selection_final <- panel_results_exval[panel_results_exval$above90 == "yes",]$prots_selection
+```
+#3 panels - ROC plots
+```{r}
+#discovery
+roc_df_list_2023_3 <- list()
+auc_values_2023_3 <- data.frame()
+
+#now loop
+for (panel in panel_selection_final) {
+    print(nrow(auc_values_2023_3)+1)
+
+    comb <- unlist(strsplit(panel, ","))
+
+    dataML <- prep_df(classifier_mat_disc, comb)
+    
+    set.seed(1234)
+    inTrain <- createDataPartition(y = dataML$type, p = 0.70, list = FALSE)
+    training <- dataML[inTrain,]
+    testing <- dataML[-inTrain,]
+    
+    xgb_model <- train_xgboost_model(training, best_params_disc)
+    
+    dtest <- xgb.DMatrix(data = as.matrix(testing[, -ncol(testing)]))
+    
+    pred_probs <- predict(xgb_model, dtest)
+    
+    roc_obj <- roc(response = as.numeric(testing$type) - 1, predictor = pred_probs)
+    
+    roc_data <- data.frame(
+      Sens = roc_obj[["sensitivities"]],
+      Spec = roc_obj[["specificities"]])
+    roc_data$SpecNeg <- 1- roc_data$Spec
+    roc_data <- roc_data[order(abs(roc_data$Sens), decreasing = FALSE), ]
+    auc_value <- roc_obj[["auc"]]
+    
+    roc_df_list_2023_3[[length(roc_df_list_2023_3) + 1]] <- roc_data
+    auc_values_2023_3[nrow(auc_values_2023_3)+1,"panel"] <- panel
+    auc_values_2023_3[nrow(auc_values_2023_3),"auc"] <- auc_value
+}
+
+#add the "panel" column to each df
+for (i in seq_along(roc_df_list_2023_3)) {
+    roc_df_list_2023_3[[i]]$panel <- panel_selection_final[i]
+}
+
+#combine all data frames in the list into a single data frame
+roc_df_2023_3 <- bind_rows(roc_df_list_2023_3)
+
+roc_df_2023_3$cohort <- "Discovery cohort"
+
+
+
+
+#validation
+roc_df_list_2024_3 <- list()
+auc_values_2024_3 <- data.frame()
+
+#now loop
+for (panel in panel_selection_final) {
+    print(nrow(auc_values_2024_3)+1)
+
+    comb <- unlist(strsplit(panel, ","))
+
+    dataML <- prep_df(classifier_mat_val, comb)
+    
+    set.seed(1234)
+    inTrain <- createDataPartition(y = dataML$type, p = 0.70, list = FALSE)
+    training <- dataML[inTrain,]
+    testing <- dataML[-inTrain,]
+    
+    xgb_model <- train_xgboost_model(training, best_params_val)
+    
+    dtest <- xgb.DMatrix(data = as.matrix(testing[, -ncol(testing)]))
+    
+    pred_probs <- predict(xgb_model, dtest)
+    
+    roc_obj <- roc(response = as.numeric(testing$type) - 1, predictor = pred_probs)
+    
+    roc_data <- data.frame(
+      Sens = roc_obj[["sensitivities"]],
+      Spec = roc_obj[["specificities"]])
+    roc_data$SpecNeg <- 1- roc_data$Spec
+    roc_data <- roc_data[order(abs(roc_data$Sens), decreasing = FALSE), ]
+    auc_value <- roc_obj[["auc"]]
+    
+    roc_df_list_2024_3[[length(roc_df_list_2024_3) + 1]] <- roc_data
+    auc_values_2024_3[nrow(auc_values_2024_3)+1,"panel"] <- panel
+    auc_values_2024_3[nrow(auc_values_2024_3),"auc"] <- auc_value
+}
+
+#add the "panel" column to each df
+for (i in seq_along(roc_df_list_2024_3)) {
+    roc_df_list_2024_3[[i]]$panel <- panel_selection_final[i]
+}
+
+#combine all data frames in the list into a single data frame
+roc_df_2024_3 <- bind_rows(roc_df_list_2024_3)
+
+roc_df_2024_3$cohort <- "Validation cohort"
+
+
+
+
+#external validation
+roc_df_list_2025_3 <- list()
+auc_values_2025_3 <- data.frame()
+
+#now loop
+for (panel in panel_selection_final) {
+    print(nrow(auc_values_2025_3)+1)
+
+    comb <- unlist(strsplit(panel, ","))
+
+    dataML <- prep_df(classifier_mat_exval, comb)
+    
+    set.seed(1234)
+    inTrain <- createDataPartition(y = dataML$type, p = 0.70, list = FALSE)
+    training <- dataML[inTrain,]
+    testing <- dataML[-inTrain,]
+    
+    xgb_model <- train_xgboost_model(training, best_params_exval)
+    
+    dtest <- xgb.DMatrix(data = as.matrix(testing[, -ncol(testing)]))
+    
+    pred_probs <- predict(xgb_model, dtest)
+    
+    roc_obj <- roc(response = as.numeric(testing$type) - 1, predictor = pred_probs)
+    
+    roc_data <- data.frame(
+      Sens = roc_obj[["sensitivities"]],
+      Spec = roc_obj[["specificities"]])
+    roc_data$SpecNeg <- 1- roc_data$Spec
+    roc_data <- roc_data[order(abs(roc_data$Sens), decreasing = FALSE), ]
+    auc_value <- roc_obj[["auc"]]
+    
+    roc_df_list_2025_3[[length(roc_df_list_2025_3) + 1]] <- roc_data
+    auc_values_2025_3[nrow(auc_values_2025_3)+1,"panel"] <- panel
+    auc_values_2025_3[nrow(auc_values_2025_3),"auc"] <- auc_value
+}
+
+#add the "panel" column to each df
+for (i in seq_along(roc_df_list_2025_3)) {
+    roc_df_list_2025_3[[i]]$panel <- panel_selection_final[i]
+}
+
+#combine all data frames in the list into a single data frame
+roc_df_2025_3 <- bind_rows(roc_df_list_2025_3)
+
+roc_df_2025_3$cohort <- "External validation cohort"
+
+
+#joint plotting
+roc_df_2023_3 <- left_join(roc_df_2023_3, auc_values_2023_3)
+
+roc_df_2024_3 <- left_join(roc_df_2024_3, auc_values_2024_3)
+
+roc_df_2025_3 <- left_join(roc_df_2025_3, auc_values_2025_3)
+
+roc_df_joint <- rbind(roc_df_2023_3, roc_df_2024_3, roc_df_2025_3)
+
+roc_df_joint <- left_join(roc_df_joint, panel_selection_info)
+
+roc_df_joint <- roc_df_joint %>%
+  mutate(panel_name = paste(gene2, gene1, sep = " + "))
+
+ggplot(roc_df_joint, aes(x = SpecNeg, y = Sens, color = panel)) +
+  geom_step(data = roc_df_joint %>% filter(cohort == "Validation cohort"), 
+             aes(x = SpecNeg, y = Sens, color = cohort), size = 1) + # Background layer
+  geom_step(data = roc_df_joint %>% filter(cohort == "Discovery cohort"), 
+             aes(x = SpecNeg, y = Sens, color = cohort), size = 1) +    # Foreground layer
+  geom_step(data = roc_df_joint %>% filter(cohort == "External validation cohort"), 
+             aes(x = SpecNeg, y = Sens, color = cohort), size = 1) +
+  geom_text(data = roc_df_joint %>% filter(cohort == "Discovery cohort"),
+            aes(x = 0.7, y = 0.40, label = paste("AUC =", sprintf("%.2f", auc)), fontface = "bold"),
+            color = "#e39a34", size = 4) +
+  geom_text(data = roc_df_joint %>% filter(cohort == "Validation cohort"),
+            aes(x = 0.7, y = 0.25, label = paste("AUC =", sprintf("%.2f", auc)), fontface = "bold"),
+            color = "#31586d", size = 4) +
+  geom_text(data = roc_df_joint %>% filter(cohort == "External validation cohort"),
+            aes(x = 0.7, y = 0.10, label = paste("AUC =", sprintf("%.2f", auc)), fontface = "bold"),
+            color = "seagreen", size = 4) +
+  facet_wrap(vars(panel_name), scales = "fixed", ncol = 8) +
+  labs(x = "1 - Specificity",
+       y = "Sensitivity",
+       color = "") +
+  scale_x_continuous(breaks = c(0, 0.5, 1)) +
+  scale_y_continuous(breaks = c(0, 0.5, 1)) +
+  theme_manuscript +
+  theme(strip.text = element_text(size = 10, color = "black", face = "bold"),
+        legend.title = element_text(size = 10, color = "black"),
+        legend.position = "right") +
+  scale_color_manual(values = c("Discovery cohort" = "#e39a34", "Validation cohort" = "#31586d", "External validation cohort" = "seagreen"))
+```
+#3 panels - boxplots
+```{r}
+#proteins within panels
+panels3_prots <- unique(c(panel_selection_info[panel_selection_info$panel %in% panel_selection_final,]$prot1,
+                          panel_selection_info[panel_selection_info$panel %in% panel_selection_final,]$prot2))
+
+#get p-values from limma
+p_2023 <- limma_disc %>%
+  filter(Contrast == "IKvIG") %>%
+  filter(Protein.Group %in% panels3_prots)
+p_2023 <- p_2023[,c(4,7,9)]
+p_2023 <- p_2023 %>%
+  mutate(cohort = "2023")
+
+p_2024 <- limma_val %>%
+  filter(Contrast == "IKvIG") %>%
+  filter(Protein.Group %in% panels3_prots)
+p_2024 <- p_2024[,c(4,7,9)]
+p_2024 <- p_2024 %>%
+  mutate(cohort = "2024")
+
+p_2025 <- limma_exval %>%
+  filter(Contrast == "IKvIG") %>%
+  filter(Protein.Group %in% panels3_prots)
+p_2025 <- p_2025[,c(4,7,9)]
+p_2025 <- p_2025 %>%
+  mutate(cohort = "2025")
+
+p_all <- rbind(p_2023, p_2024, p_2025)
+
+#get df with abundance values for each cohort
+
+#sample_ids_IKIG_disc already existing
+#sample_ids_IKIG_val already existing
+sample_ids_IKIG_exval <- annot_exval[annot_exval$type != "ZG",]$sample_id
+
+to_box_2023 <- prot_mat_disc[panels3_prots,sample_ids_IKIG_disc]
+to_box_2023 <- as.data.frame(t(scale(t(to_box_2023))))
+to_box_2023 <- as.data.frame(to_box_2023) %>%
+  rownames_to_column("Protein.Group")
+to_box_2023 <- pivot_longer(data = to_box_2023, cols = 2:length(to_box_2023), names_to = "sample_id", values_to = "abundance")
+to_box_2023 <- left_join(to_box_2023, prot2gene)
+to_box_2023 <- left_join(to_box_2023, annot_disc[,c(1,2)])
+
+to_box_2024 <- prot_mat_val[panels3_prots,sample_ids_IKIG_val]
+to_box_2024 <- as.data.frame(t(scale(t(to_box_2024))))
+to_box_2024 <- as.data.frame(to_box_2024) %>%
+  rownames_to_column("Protein.Group")
+to_box_2024 <- pivot_longer(data = to_box_2024, cols = 2:length(to_box_2024), names_to = "sample_id", values_to = "abundance")
+to_box_2024 <- left_join(to_box_2024, prot2gene)
+to_box_2024 <- left_join(to_box_2024, annot_val[,c(1,2)])
+
+to_box_2025 <- prot_mat_exval[panels3_prots,sample_ids_IKIG_exval]
+to_box_2025 <- as.data.frame(t(scale(t(to_box_2025))))
+to_box_2025 <- as.data.frame(to_box_2025) %>%
+  rownames_to_column("Protein.Group")
+to_box_2025 <- pivot_longer(data = to_box_2025, cols = 2:length(to_box_2025), names_to = "sample_id", values_to = "abundance")
+to_box_2025 <- left_join(to_box_2025, prot2gene)
+to_box_2025 <- left_join(to_box_2025, annot_exval[,c(1,2)])
+
+#make df in long format for plotting
+to_box <- rbind(to_box_2023, to_box_2024, to_box_2025)
+
+to_box <- left_join(to_box,p_all)
+
+to_box <- to_box %>%
+  mutate(asterisks = case_when(P.Value <= 0.0001 ~ "****",
+                               P.Value <= 0.001 & P.Value > 0.0001 ~ "***",
+                               P.Value <= 0.01 & P.Value > 0.001 ~ "**",
+                               P.Value <= 0.05 & P.Value > 0.01 ~ "*"))
+
+#make a df to save information for the bracket plotting
+max1 <- max(to_box[to_box$Genes == "TACSTD2" & to_box$cohort == "2023",]$abundance, na.rm = T)
+max2 <- max(to_box[to_box$Genes == "SERPINB5" & to_box$cohort == "2023",]$abundance, na.rm = T)
+max3 <- max(to_box[to_box$Genes == "ASS1" & to_box$cohort == "2023",]$abundance, na.rm = T)
+max4 <- max(to_box[to_box$Genes == "GRB2" & to_box$cohort == "2023",]$abundance, na.rm = T)
+
+max5 <- max(to_box[to_box$Genes == "TACSTD2" & to_box$cohort == "2024",]$abundance, na.rm = T)
+max6 <- max(to_box[to_box$Genes == "SERPINB5" & to_box$cohort == "2024",]$abundance, na.rm = T)
+max7 <- max(to_box[to_box$Genes == "ASS1" & to_box$cohort == "2024",]$abundance, na.rm = T)
+max8 <- max(to_box[to_box$Genes == "GRB2" & to_box$cohort == "2024",]$abundance, na.rm = T)
+
+max9 <- max(to_box[to_box$Genes == "TACSTD2" & to_box$cohort == "2025",]$abundance, na.rm = T)
+max10 <- max(to_box[to_box$Genes == "SERPINB5" & to_box$cohort == "2025",]$abundance, na.rm = T)
+max11 <- max(to_box[to_box$Genes == "ASS1" & to_box$cohort == "2025",]$abundance, na.rm = T)
+max12 <- max(to_box[to_box$Genes == "GRB2" & to_box$cohort == "2025",]$abundance, na.rm = T)
+
+
+to_box_info <- data.frame(Protein.Group = rep(panels3_prots, 3),
+                          max = c(max1,max2,max3,max4, max5, max6,
+                                  max7, max8, max9, max10, max11, max12),
+                          cohort = c(rep("2023", 4), rep("2024", 4), rep("2025", 4)))
+
+to_box <- left_join(to_box,to_box_info)
+
+to_box <- to_box %>%
+  mutate(cohort = gsub("2023", "Discovery", cohort)) %>%
+  mutate(cohort = gsub("2024", "Validation", cohort)) %>%
+  mutate(cohort = gsub("2025", "External val.", cohort))
+
+to_box$cohort <- factor(to_box$cohort, levels = c("Discovery", "Validation", "External val."))
+
+#plot and color by cohort
+ggplot(to_box[to_box$Genes == "TACSTD2",], aes(x = type, y = abundance, fill = type)) +
+  geom_boxplot(aes(fill = type), color = "black", linewidth = 0.5, outlier.size = 0.5,
+               fatten = 1) +  
+  geom_bracket(data = subset(to_box, Genes == "TACSTD2"), vjust = +0.4,
+               xmin = 1, xmax = 2, y.position = to_box$max[to_box$Genes == "TACSTD2"] + 0.6,
+               label = to_box$asterisks[to_box$Genes == "TACSTD2"], size = 0.4, label.size = 4) +
+  facet_wrap(. ~ cohort, scales = "free") +
+  theme_manuscript +
+  theme(
+    plot.title = element_text(size = 10, color = "black", face = "bold", hjust = 0.5),
+    strip.text = element_text(size = 10, color = "black", face = "bold"),
+    axis.text = element_blank(),
+    axis.ticks = element_blank()
+  ) +
+  ylim(-3.6,3.7) +
+  labs(x = "", y = "Log2 abundance", title = "TACSTD2") +
+  scale_fill_manual(values = new_colors$values)
+
+
+ggplot(to_box[to_box$Genes == "SERPINB5",], aes(x = type, y = abundance, fill = type)) +
+  geom_boxplot(aes(fill = type), color = "black", linewidth = 0.5, outlier.size = 0.5,
+               fatten = 1) +  
+  geom_bracket(data = subset(to_box, Genes == "SERPINB5"), vjust = +0.4,
+               xmin = 1, xmax = 2, y.position = to_box$max[to_box$Genes == "SERPINB5"] + 0.6,
+               label = to_box$asterisks[to_box$Genes == "SERPINB5"], size = 0.4, label.size = 4) +
+  facet_wrap(. ~ cohort, scales = "free") +
+  theme_manuscript +
+  theme(
+    plot.title = element_text(size = 10, color = "black", face = "bold", hjust = 0.5),
+    strip.text = element_text(size = 10, color = "black", face = "bold"),
+    axis.text = element_blank(),
+    axis.ticks = element_blank()
+  ) +
+  ylim(-3.8,2.5) +
+  labs(x = "", y = "Log2 abundance", title = "SERPINB5") +
+  scale_fill_manual(values = new_colors$values)
+
+ggplot(to_box[to_box$Genes == "ASS1",], aes(x = type, y = abundance, fill = type)) +
+  geom_boxplot(aes(fill = type), color = "black", linewidth = 0.5, outlier.size = 0.5,
+               fatten = 1) +  
+  geom_bracket(data = subset(to_box, Genes == "ASS1"), vjust = +0.4,
+               xmin = 1, xmax = 2, y.position = to_box$max[to_box$Genes == "ASS1"] + 0.6,
+               label = to_box$asterisks[to_box$Genes == "ASS1"], size = 0.4, label.size = 4) +
+  facet_wrap(. ~ cohort, scales = "free") +
+  theme_manuscript +
+  theme(
+    plot.title = element_text(size = 10, color = "black", face = "bold", hjust = 0.5),
+    strip.text = element_text(size = 10, color = "black", face = "bold"),
+    axis.text = element_blank(),
+    axis.ticks = element_blank()
+  ) +
+  ylim(-4,3.7) +
+  labs(x = "", y = "Log2 abundance", title = "ASS1") +
+  scale_fill_manual(values = new_colors$values)
+
+ggplot(to_box[to_box$Genes == "GRB2",], aes(x = type, y = abundance, fill = type)) +
+  geom_boxplot(aes(fill = type), color = "black", linewidth = 0.5, outlier.size = 0.5,
+               fatten = 1) +  
+  geom_bracket(data = subset(to_box, Genes == "GRB2"), vjust = +0.4,
+               xmin = 1, xmax = 2, y.position = to_box$max[to_box$Genes == "GRB2"] + 0.6,
+               label = to_box$asterisks[to_box$Genes == "GRB2"], size = 0.4, label.size = 4) +
+  facet_wrap(. ~ cohort, scales = "free") +
+  theme_manuscript +
+  theme(
+    plot.title = element_text(size = 10, color = "black", face = "bold", hjust = 0.5),
+    strip.text = element_text(size = 10, color = "black", face = "bold"),
+    axis.text = element_blank(),
+    axis.ticks = element_blank()
+  ) +
+  ylim(-2.8,3.3) +
+  labs(x = "", y = "Log2 abundance", title = "GRB2") +
+  scale_fill_manual(values = new_colors$values)
+```
+

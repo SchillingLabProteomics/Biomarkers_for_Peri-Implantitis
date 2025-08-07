@@ -1,0 +1,825 @@
+### Analysis of Proteolytic Processing - Discovery Cohort ###
+#by AT
+
+#libraries
+```{r}
+devtools::install_github("MiguelCos/TermineR")
+library(TermineR)
+library(tidyverse)
+library(limma)
+library(clusterProfiler)
+library(org.Hs.eg.db)
+library(here)
+library(janitor)
+library(seqinr)
+library(ggpubr)
+library(ggsignif)
+library(ggrepel)
+library(SummarizedExperiment)
+library(RColorBrewer)
+library(diann)
+library(dplyr)
+library(tibble)
+library(tidyr)
+library(stringr)
+library(data.table)
+library(readxl)
+library(visdat)
+library(arrow)
+library(mixOmics)
+library(FSA)
+library(ComplexHeatmap)
+library(colorRamp2)
+```
+
+#colors and ggplot theme
+```{r}
+new_colors <- list(
+  values = c("IK" = "#c44826", "IG" = "#5d7034", "ZG" = "#7da4b7"),
+  labels = c("IK" = "peri-implantitis", "IG" = "healthy implant", "ZG" = "healthy tooth")
+)
+
+theme_manuscript <- theme(
+        axis.text = element_text(size = 10, color = "black"),
+        axis.title.x = element_text(size = 10, color = "black", face = "bold", margin = margin(t = 0)),
+        axis.title.y = element_text(size = 10, color = "black", face = "bold", margin = margin(r = 0)),
+        strip.text = element_text(size = 10, color = "black", face = "bold"),
+        strip.background = element_rect(fill = "white"),
+        legend.text = element_text(size = 10, color = "black"),
+        legend.title = element_blank(),
+        panel.background = element_blank(),
+        panel.grid.major = element_line(color = "white"),
+        panel.border = element_rect(colour = "black", 
+                                    fill = NA, 
+                                    linewidth = 1),
+        legend.spacing.y = unit(0.5, "cm"),
+        legend.position = "none")
+```
+#load data
+```{r}
+diann_parquet <- "report.parquet"
+diann_raw <- arrow::read_parquet(diann_parquet)
+
+#adjust the column "Run" to "File.Name", otherwise diann_matrix() won't work
+names(diann_raw)[names(diann_raw) == 'Run'] <- 'File.Name'
+
+peptides_maxlfq <- diann_maxlfq(diann_raw[diann_raw$Q.Value <= 0.01 &
+                                          diann_raw$PG.Q.Value <= 0.01 &
+                                          diann_raw$Proteotypic == 1,],
+                                group.header = "Stripped.Sequence",
+                                id.header = "Precursor.Id",
+                                quantity.header = "Precursor.Normalised")
+
+#remove the same files as in protein level analysis
+samples_remove <- c("AT121_S1-A6_1_2160", "AT122_S1-A7_1_2161", "AT126_S1-A11_1_2165",
+                    "AT142_S1-C3_1_2181", "AT143_S1-C4_1_2182", "AT167_S1-E4_1_2207", 
+                    "AT173_S1-E10_1_2213", "AT177_S1-F2_1_2217", "AT181_S1-F6_1_2221",
+                    "AT191_rep_S1-B1_1_2398", "AT196_S1-G9_1_2236", "AT197_S1-G10_1_2237",
+                    "AT225_S1-B2_1_2266", "AT229_S1-B6_1_2270", "AT255_S1-D8_1_2297",
+                    "AT259_S1-D12_1_2301", "AT276_S1-F5_1_2318")
+
+#remove those samples
+peptides_mat <- peptides_maxlfq[,!(colnames(peptides_maxlfq) %in% samples_remove)]
+
+#adjust file names
+files <- colnames(peptides_mat)
+files <- substr(files, 1, 5)
+colnames(peptides_mat) <- files
+
+#load annotation file
+sample_annot <- read.csv("annot_data_fil_discovery.csv", row.names = 1)
+
+#extract the samples to keep
+sample_ids_fil <- sample_annot$sample_id
+sample_ids_IKIG <- sample_annot[sample_annot$type != "ZG",]$sample_id
+
+type_fil <- sample_annot$type
+type_fil_IKIG <- sample_annot[sample_annot$type != "ZG",]$type
+
+#keep only those samples
+peptides_mat <- peptides_mat[,sample_ids_fil]
+
+#log2
+peptides_mat <- log2(peptides_mat)
+
+#also save a df with peptides, protein IDs and genes from diann_raw
+pep2prot2gene <- diann_raw[,c(7,12,15)]
+
+pep2prot2gene$Uniprot <- str_replace(pep2prot2gene$Protein.Ids," .*", "")
+
+pep2prot2gene <- distinct(pep2prot2gene, Stripped.Sequence, Protein.Ids, Genes, .keep_all = TRUE)
+
+```
+#peptide annotation
+```{r}
+#prepare df for termineR annotation function
+peps <- rownames(peptides_mat)
+
+peptides_mat_prep <- data.frame(nterm_modif_peptide = paste0("n_", peps),
+                                nterm_modif = "n",
+                                peptide = peps)
+
+peptides_mat_prep <- left_join(peptides_mat_prep, pep2prot2gene[,c(1,4)], by = c("peptide" = "Stripped.Sequence"))
+
+colnames(peptides_mat_prep)[4] = "protein"
+
+peptides_mat_col <- as.data.frame(peptides_mat) %>%
+  rownames_to_column("peptide")
+
+peptides_mat_prep <- left_join(peptides_mat_prep, peptides_mat_col)
+ 
+annotated_peptides <- annotate_neo_termini(
+  peptides_df = peptides_mat_prep,
+  fasta_location = "human_ebi-reference_2023-07-22_iRT_with-contaminants.fasta",
+  sense = "C", 
+  specificity = "K|R", # sense C and specificity K|R for trypsin digestion
+  organism = "human"
+)
+
+#save a vector of the semi-specific peptides
+peptides_semi <- annotated_peptides$peptide[annotated_peptides$specificity == "semi_Nterm" |
+                                              annotated_peptides$specificity == "semi_Cterm"]
+
+#visualize peptide annotation
+count_matches  <- annotated_peptides %>%
+  filter(
+    # exclude peptides with no categorization for Uniprot processing information
+    !is.na(uniprot_processing_type)) %>%
+  dplyr::count(uniprot_processing_type) %>%
+  mutate(
+    uniprot_processing_type = factor(
+      uniprot_processing_type, 
+      levels = c(
+        "SIGNAL",
+        "PROPEP",
+        "TRANSIT",
+        "INIT_MET",
+        "INIT_MET_not_canonical",
+        "Intact_ORF",
+        "not_canonical",
+        "not_canonical_no_procc_annot"
+      )
+    )
+  )
+
+#all
+ggplot(count_matches, aes(x = uniprot_processing_type, y = n)) +
+  geom_bar(stat = "identity") +
+  geom_text(aes(label = n), hjust = -0.1, size = 3) +
+  coord_flip() +
+  ylim(0, max(count_matches$n) + 1000) +
+  labs(y = "Number of peptides by matching type",
+       x = "") +
+  theme(axis.text.x = element_text(size = 10),
+        axis.text.y = element_text(size = 10),
+        panel.border = element_rect(fill = NA, linewidth = 1.5),
+        axis.title = element_text(size = 12, face = "bold"))
+
+#without the specific
+count_matches_onlysemi  <- annotated_peptides %>%
+  filter(
+    #exclude specific peptide
+    specificity != "specific",
+    # exclude peptides with no categorization for Uniprot processing information
+    uniprot_processing_type != "not_canonical_no_procc_annot") %>%
+  dplyr::count(uniprot_processing_type) %>%
+  mutate(
+    uniprot_processing_type = factor(
+      uniprot_processing_type, 
+      levels = c(
+        "SIGNAL",
+        "PROPEP",
+        "TRANSIT",
+        "INIT_MET",
+        "INIT_MET_not_canonical",
+        "Intact_ORF",
+        "not_canonical",
+        "not_canonical_no_procc_annot"
+      )
+    )
+  )
+
+ggplot(count_matches_onlysemi, aes(x = uniprot_processing_type, y = n)) +
+  geom_bar(stat = "identity") +
+  geom_text(aes(label = n), hjust = -0.1, size = 3) +
+  coord_flip() +
+  ylim(0, max(count_matches_onlysemi$n) + 400) +
+  labs(y = "Number of peptides by matching type",
+       x = "") +
+  theme(axis.text.x = element_text(size = 10),
+        axis.text.y = element_text(size = 10),
+        panel.border = element_rect(fill = NA, linewidth = 1.5),
+        axis.title = element_text(size = 12, face = "bold"))
+
+#count specificity
+count_specificity  <- annotated_peptides %>%
+  dplyr::count(specificity)
+```
+#make a annot_pep_mat and a annot_pep_mat_long data frame
+```{r}
+annot_pep_mat <- annotated_peptides[,c(3,4,13,32:length(annotated_peptides))]
+
+annot_pep_mat_long <- pivot_longer(annot_pep_mat, cols=4:length(annot_pep_mat), names_to = "sample_id", values_to = "abundance")
+
+annot_pep_mat_long <- left_join(annot_pep_mat_long, sample_annot[,c(1,2)])
+
+ggplot(annot_pep_mat_long, aes(x = type, y = abundance, fill = specificity)) +
+  geom_boxplot(lwd = 1) +
+  labs(x = "", y = "") +
+  theme(axis.text = element_text(size = 15, color = "black"),
+        axis.title = element_text(size = 15, color = "black", face = "bold"),
+        strip.text = element_text(size = 15, color = "black", face = "bold"),
+        legend.text = element_text(size = 15, color = "black"),
+        legend.title = element_blank(),
+        panel.background = element_rect(color="grey"),
+        panel.grid.major = element_line(color = "white"),
+        panel.border = element_rect(colour = "white", 
+                                    fill = NA, 
+                                    size = 0.5),
+        plot.title = element_text(hjust = 0.5, face = "bold"),
+        legend.spacing.y = unit(0.5, "cm"),
+        legend.position = "right")
+
+ggplot(annot_pep_mat_long, aes(x = sample_id, y = log2(abundance))) +
+  geom_boxplot(lwd = 1) +
+  labs(x = "", y = "") +
+  theme(axis.text.x = element_text(size = 15, color = "black", angle = 90),
+        axis.text.y = element_text(size = 15, color = "black"),
+        axis.title = element_text(size = 15, color = "black", face = "bold"),
+        strip.text = element_text(size = 15, color = "black", face = "bold"),
+        legend.text = element_text(size = 15, color = "black"),
+        legend.title = element_blank(),
+        panel.background = element_rect(color="grey"),
+        panel.grid.major = element_line(color = "white"),
+        panel.border = element_rect(colour = "white", 
+                                    fill = NA, 
+                                    size = 0.5),
+        plot.title = element_text(hjust = 0.5, face = "bold"),
+        legend.spacing.y = unit(0.5, "cm"),
+        legend.position = "none")
+```
+#semi-specific per samples - counts
+```{r}
+#absolute counts 
+semi_counts <- annot_pep_mat %>%
+  summarise(
+    # Total counts (non-NA values per sample)
+    across(starts_with("AT"), ~ sum(!is.na(.)), .names = "total_{.col}"),
+    
+    # Counts for "specific" only
+    across(starts_with("AT"), ~ sum(!is.na(.) & specificity == "specific"), .names = "specific_{.col}"),
+    
+    # Counts for "semi_Nterm" or "semi_Cterm" only
+    across(starts_with("AT"), ~ sum(!is.na(.) & specificity %in% c("semi_Nterm", "semi_Cterm")), .names = "semi_{.col}")
+  ) %>%
+  pivot_longer(
+    cols = everything(), 
+    names_to = c(".value", "sample_id"), 
+    names_pattern = "(.*)_(AT\\d+)"
+  )
+
+semi_counts$semi_ratio <- semi_counts$semi / semi_counts$total
+
+semi_counts <- left_join(semi_counts, sample_annot[,c(1,2)])
+
+
+# Perform Kruskal-Wallis test first (test whether values differ among my three groups)
+# if significant, then do post-hoc Dunn's test
+
+# 1 - Count ratios
+pairwise_result <- kruskal.test(semi_ratio ~ type, data = semi_counts)
+print(pairwise_result) 
+# no sig. differences
+dunn_result <- dunnTest(semi_ratio ~ type, data = semi_counts, method = "bonferroni")
+#in console: dunn_result[["res"]]
+#  Comparison          Z    P.unadj     P.adj
+#1    IG - IK -1.3371971 0.18115831 0.5434749
+#2    IG - ZG  0.8935434 0.37156624 1.0000000
+#3    IK - ZG  1.9627247 0.04967817 0.1490345
+
+# 2 - Absolute counts semi-specific only
+pairwise_result <- kruskal.test(semi ~ type, data = semi_counts)
+print(pairwise_result)
+#p-value = 0.01882
+dunn_result <- dunnTest(semi ~ type, data = semi_counts, method = "bonferroni")
+#in console: dunn_result[["res"]]
+#  Comparison          Z     P.unadj      P.adj
+#1    IG - IK -2.3996860 0.016409143 0.04922743
+#2    IG - ZG  0.5423001 0.587611752 1.00000000
+#3    IK - ZG  2.6024551 0.009255895 0.02776768
+
+# 3 - Absolute counts total
+pairwise_result <- kruskal.test(total ~ type, data = semi_counts)
+print(pairwise_result)
+#p-value = 0.04148
+dunn_result <- dunnTest(total ~ type, data = semi_counts, method = "bonferroni")
+#in console: dunn_result[["res"]]
+#  Comparison         Z    P.unadj      P.adj
+#1    IG - IK -2.267365 0.02336791 0.07010373
+#2    IG - ZG  0.239804 0.81048223 1.00000000
+#3    IK - ZG  2.222692 0.02623658 0.07870975
+
+
+#plot of absolute counts
+semi_counts$type_name <- semi_counts$type
+
+semi_counts$type_name <- str_replace(semi_counts$type_name, "IK", "Peri-\nimplantitis") 
+semi_counts$type_name <- str_replace(semi_counts$type_name, "IG", "Healthy\nimplant") 
+semi_counts$type_name <- str_replace(semi_counts$type_name, "ZG", "Healthy\ntooth") 
+
+semi_counts$type_name <- factor(semi_counts$type_name,
+                                         levels = c("Peri-\nimplantitis", "Healthy\nimplant", "Healthy\ntooth"))
+
+ggplot(semi_counts, aes(x = type_name, y = semi)) +
+  geom_violin(aes(fill = type), alpha = 0.9) +
+  geom_boxplot(width = .1, lwd = 0.5, aes(fill = type)) +
+  geom_bracket(xmin = 1, xmax = 2, y.position = 7300, label = "*", size = 0.4, label.size = 5, vjust = +0.5) +
+  geom_bracket(xmin = 1, xmax = 3, y.position = 6800, label = "*", size = 0.4, label.size = 5, vjust = +0.5) +
+  labs(x = "", y = "Semi-specific peptide IDs") +
+  ylim(1300, 7400) +
+  theme_manuscript +
+  theme(axis.title.y = element_text(size = 10, color = "black", face = "bold")) +
+  scale_fill_manual(labels = new_colors$labels, values = new_colors$values)
+
+
+#plot of count ratios in manuscript format
+ggplot(semi_counts, aes(x = type_name, y = semi_ratio)) +
+  geom_violin(aes(fill = type), alpha = 0.9) +
+  geom_boxplot(width = .1, lwd = 0.5, aes(fill = type)) +
+  geom_bracket(xmin = 1, xmax = 2, y.position = 0.242, label = "ns", size = 0.4, label.size = 4, vjust = 0) +
+  geom_bracket(xmin = 1, xmax = 3, y.position = 0.228, label = "ns", size = 0.4, label.size = 4, vjust = 0) +
+  labs(x = "", y = "Ratio of semi-specific peptide IDs") +
+  scale_y_continuous(limits = c(0.118, 0.244), breaks = c(0.12, 0.17, 0.22)) +
+  theme_manuscript +
+  theme(axis.title.y = element_text(size = 10, color = "black", face = "bold")) +
+  scale_fill_manual(labels = new_colors$labels, values = new_colors$values)
+
+```
+
+
+#semi-specific per samples - intensity
+```{r}
+semi_ints <- annot_pep_mat %>%
+  summarise(
+    # Total sums (sum of non-NA values per sample)
+    across(starts_with("AT"), ~ sum(., na.rm = TRUE), .names = "total_{.col}"),
+    
+    # Sums for "specific" only
+    across(starts_with("AT"), ~ sum(.[specificity == "specific"], na.rm = TRUE), .names = "specific_{.col}"),
+    
+    # Sums for "semi_Nterm" or "semi_Cterm" only
+    across(starts_with("AT"), ~ sum(.[specificity %in% c("semi_Nterm", "semi_Cterm")], na.rm = TRUE), .names = "semi_{.col}")
+  ) %>%
+  pivot_longer(
+    cols = everything(), 
+    names_to = c(".value", "sample_id"), 
+    names_pattern = "(.*)_(AT\\d+)"
+  )
+
+semi_ints$semi_ratio <- semi_ints$semi / semi_ints$total
+
+semi_ints <- left_join(semi_ints, sample_annot[,c(1,2)])
+
+# Perform Kruskal-Wallis test first (test whether values differ among my three groups)
+# if signigficant, then do post-hoc Dunn's test
+
+# 1 - Intensity ratios
+pairwise_result <- kruskal.test(semi_ratio ~ type, data = semi_ints)
+print(pairwise_result) 
+# no sig. differences
+
+# 2 - Absolute intensities semi-specific only
+pairwise_result <- kruskal.test(semi ~ type, data = semi_ints)
+print(pairwise_result)
+#p-value = 0.01626
+dunn_result <- dunnTest(semi ~ type, data = semi_ints, method = "bonferroni")
+#in console: dunn_result[["res"]]
+#  Comparison          Z     P.unadj      P.adj
+#1    IG - IK -2.4361164 0.014845905 0.04453771
+#2    IG - ZG  0.5658445 0.571499505 1.00000000
+#3    IK - ZG  2.6552346 0.007925327 0.02377598
+
+# 3 - Absolute counts total
+pairwise_result <- kruskal.test(total ~ type, data = semi_ints)
+print(pairwise_result)
+#p-value = 0.03815
+dunn_result <- dunnTest(total ~ type, data = semi_ints, method = "bonferroni")
+#in console: dunn_result[["res"]]
+#  Comparison          Z    P.unadj      P.adj
+#1    IG - IK -2.2926374 0.02186889 0.06560668
+#2    IG - ZG  0.2527394 0.80046956 1.00000000
+#3    IK - ZG  2.2563607 0.02404805 0.07214416
+
+#plot of absolute intensities
+semi_ints$type_name <- semi_ints$type
+
+semi_ints$type_name <- str_replace(semi_ints$type_name, "IK", "Peri-\nimplantitis") 
+semi_ints$type_name <- str_replace(semi_ints$type_name, "IG", "Healthy\nimplant") 
+semi_ints$type_name <- str_replace(semi_ints$type_name, "ZG", "Healthy\ntooth") 
+
+semi_ints$type_name <- factor(semi_ints$type_name,
+                                         levels = c("Peri-\nimplantitis", "Healthy\nimplant", "Healthy\ntooth"))
+
+
+ggplot(semi_ints, aes(x = type_name, y = log2(semi))) +
+  geom_violin(aes(fill = type), alpha = 0.9) +
+  geom_boxplot(width = .1, lwd = 0.5, aes(fill = type)) +
+  geom_bracket(xmin = 1, xmax = 2, y.position = 16.65, label = "*", size = 0.4, label.size = 5, vjust = +0.5) +
+  geom_bracket(xmin = 1, xmax = 3, y.position = 16.42, label = "*", size = 0.4, label.size = 5, vjust = +0.5) +
+  labs(x = "", y = "Log2 intensity of\nsemi-specific peptides") +
+  theme_manuscript +
+  theme(axis.title.y = element_text(size = 10, color = "black", face = "bold")) +
+  scale_fill_manual(labels = new_colors$labels, values = new_colors$values) +
+  scale_y_continuous(limits = c(14, 16.7), breaks = c(14,15,16))
+
+ggplot(semi_ints, aes(x = type_name, y = semi_ratio)) +
+  geom_violin(aes(fill = type), alpha = 0.9) +
+  geom_boxplot(width = .1, lwd = 0.5, aes(fill = type)) +
+  geom_bracket(xmin = 1, xmax = 2, y.position = 0.242, label = "ns", size = 0.4, label.size = 4, vjust = 0) +
+  geom_bracket(xmin = 1, xmax = 3, y.position = 0.228, label = "ns", size = 0.4, label.size = 4, vjust = 0) +
+  labs(x = "", y = "Ratio of log2 intensities of\nsemi-specific peptides") +
+  theme_manuscript +
+  theme(axis.title.y = element_text(size = 10, color = "black", face = "bold")) +
+  scale_fill_manual(labels = new_colors$labels, values = new_colors$values) +
+  scale_y_continuous(limits = c(0.118, 0.244), breaks = c(0.12, 0.17, 0.22))
+
+```
+#prepare data for statistics
+```{r}
+peptides_mat <- as.data.frame(peptides_mat)
+
+#peptide matrix with semi-specific peptides only
+peptides_mat_semi <- peptides_mat %>%
+  rownames_to_column("peptide") %>%
+  filter(peptide %in% peptides_semi) %>%
+  column_to_rownames("peptide")
+
+peptides_mat_semi_col <- peptides_mat_semi %>%
+  rownames_to_column("peptide")
+
+peptides_mat_semi_long <- pivot_longer(peptides_mat_semi_col, cols=2:length(peptides_mat_semi_col),
+                                       names_to = "sample_id", values_to = "abundance")
+
+peptides_mat_semi_long <- left_join(peptides_mat_semi_long, pep2prot2gene, by = c("peptide" = "Stripped.Sequence"))
+
+peptides_mat_semi_long <- left_join(peptides_mat_semi_long, sample_annot)
+
+
+```
+#Check missingness
+```{r}
+#check missingness 
+vis_miss(peptides_mat_semi, warn_large_data = FALSE) +
+  theme_manuscript +
+  labs(y = "Semi-specific peptides") +
+  theme(axis.ticks.x = element_blank(),
+        axis.text.x = element_blank(),
+        axis.title.y = element_text(size = 10, color = "black", face = "bold"),
+        legend.position = "right",
+        legend.spacing = unit(0.5, "cm"),
+        panel.border = element_blank()) +
+  guides(fill = guide_legend(byrow = TRUE))
+
+#do sparsity reduction - condition independent and condition dependent
+
+#condition independent
+#keep only those peptides <= 50% NAs in the whole cohort 
+peptides_mat_semi_sparsred <- peptides_mat_semi[rowMeans(is.na(peptides_mat_semi)) <= 0.5, ]
+
+
+#condition dependent
+conditions <- unique(type_fil)
+
+# Create an empty data frame to store the results
+missingness_df <- data.frame(matrix(NA,
+                                    nrow = nrow(peptides_mat_semi),
+                                    ncol = length(conditions)))
+colnames(missingness_df) <- conditions
+
+# Iterate over each condition
+for (condition in conditions) {
+  # Subset samples based on the current condition
+  samples <- sample_annot$sample_id[sample_annot$type == condition]
+  # Calculate missingness for the current condition
+  missingness <- rowSums(is.na(peptides_mat_semi[, samples])) / length(samples)
+  # Filter rows based on missingness threshold
+  missingness_df[, condition] <- missingness
+}
+
+
+#Filter for semi-specific peptides with <= 30% NAs in IK and >= 70% NAs in IG
+rows_30inIK <- which(missingness_df$IK <= 0.3 & missingness_df$IG >= 0.7)
+#9 peptides
+
+#Filter for semi-specific peptides with <= 30% NAs in IG and >= 70% NAs in IK
+rows_30inIG <- which(missingness_df$IG <= 0.3 & missingness_df$IK >= 0.7)
+#1 peptide
+
+#Filter for semi-specific peptides with <= 30% NAs in IK
+rows_30NA <- which(missingness_df$IK <= 0.3)
+#1655 peptides
+peptides_mat_semi_30inIK <- peptides_mat_semi[rows_30NA, ]
+
+#Filter for semi-specific peptides with <= 20% NAs in IK
+rows_20NA <- which(missingness_df$IK <= 0.2)
+#1201 peptides
+peptides_mat_semi_20inIK <- peptides_mat_semi[rows_20NA, ]
+
+#Filter for semi-specific peptides with <= 30% NAs in one of the conditions
+rows_30 <- which(missingness_df$IK <= 0.3 | missingness_df$IG <= 0.3 | missingness_df$ZG <= 0.3)
+#1915 peptides
+peptides_mat_semi_sparsred30 <- peptides_mat_semi[rows_30, ]
+
+vis_miss(peptides_mat_semi_30inIK, warn_large_data = FALSE) +
+  theme_manuscript +
+  labs(y = "Semi-specific peptides") +
+  theme(axis.ticks.x = element_blank(),
+        axis.text.x = element_blank(),
+        axis.title.y = element_text(size = 10, color = "black", face = "bold"),
+        legend.position = "right",
+        legend.spacing = unit(0.5, "cm"),
+        panel.border = element_blank()) +
+  guides(fill = guide_legend(byrow = TRUE))
+
+
+```
+#differential abundance analysis of semi-specific peptides
+```{r}
+#use the same patient-matched design as for limma on protein level
+patients_fil <- sample_annot$patient_id
+
+design_multi_matched <- model.matrix(~0+type_fil)
+
+row.names(design_multi_matched) <- colnames(peptides_mat_semi_30inIK)
+colnames(design_multi_matched) <- colnames(design_multi_matched) %>% str_remove(., "type_fil") %>% str_trim()
+
+# define contrasts
+contrast.matrix2 <- makeContrasts(IKvIG = IK-IG,
+                                  IKvZG = IK-ZG,
+                                  IGvZG = IG-ZG,
+                                 levels = design_multi_matched)
+
+n_contrasts <- dim(contrast.matrix2)[2]
+
+
+# run limma
+fit <- lmFit(peptides_mat_semi_30inIK, 
+             design = design_multi_matched,
+             method = "robust", 
+             block = patients_fil)
+
+fit2 <- contrasts.fit(fit, 
+                      contrast.matrix2)
+
+fit2 <- eBayes(fit2)
+
+output_limma <- topTable(fit2, adjust.method = "BH", number = Inf)
+
+output_limma$peptide <- row.names(output_limma)
+
+#generate output list
+list_tabular <- list()
+
+for (i in 1:n_contrasts){
+  outlim <- topTable(fit2, coef = i, adjust.method = "BH", number = Inf)
+  outlim$peptide <- row.names(outlim)
+  outlim$Contrast <- colnames(contrast.matrix2)[i]
+  list_tabular[[i]] <- outlim
+}
+
+names(list_tabular) <- colnames(contrast.matrix2)
+
+merged_limma <- reshape::merge_all(list_tabular)
+
+merged_limma <- left_join(merged_limma, pep2prot2gene, by = c("peptide" = "Stripped.Sequence"))
+
+merged_limma <- merged_limma %>%
+  mutate(Differentially_expressed = case_when(adj.P.Val <= 0.05 ~ TRUE, TRUE ~ FALSE)) 
+
+merged_limma <- merged_limma %>%
+  mutate(plot_col_05 = case_when(adj.P.Val <= 0.05 & logFC > 0 ~ "up",
+                              adj.P.Val <= 0.05 & logFC < 0 ~ "down",
+                              adj.P.Val > 0.05 ~ "none"))
+
+limma_all3 <- merged_limma
+
+#plot_col for adj. p-value cutoff of 0.05
+limma_all3 <- limma_all3 %>%
+  mutate(plot_col_05_contrast = paste(Contrast, plot_col_05, sep = "+"))
+
+
+#volcano plots
+limma_all3$Contrast <- factor(limma_all3$Contrast, levels = c("IKvIG", "IKvZG", "IGvZG"))
+
+ggplot(data = limma_all3, 
+       mapping = aes(x = logFC,
+                     y = -log10(adj.P.Val),
+                     color = plot_col_05_contrast)) + 
+  geom_point(size = 1) + 
+  facet_grid(. ~ Contrast, scales = "free") +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed", color = "gray20", size = 0.5) +
+  labs(x = "Log2 FC", y = "-Log10 adj. p-value") + 
+  theme_manuscript +
+  ylim(0,6.2) +
+  theme(strip.text = element_blank(), strip.background = element_blank()) +
+  scale_color_manual(values = c("IGvZG+up" = "#5d7034",
+                                "IGvZG+down" = "#7da4b7",
+                                "IGvZG+none" = "gray40",
+                                "IKvIG+up" = "#c44826",
+                                "IKvIG+down" = "#5d7034",
+                                "IKvIG+none" = "gray40",
+                                "IKvZG+up" = "#c44826",
+                                "IKvZG+down" = "#7da4b7",
+                                "IKvZG+none" = "gray40")) 
+```
+#heatmap of sig diff abundant peptides
+```{r}
+#make data frame with sig. peptides in IKvIG
+selection_limma <- limma_all3 %>%
+  filter(Contrast == "IKvIG" & Differentially_expressed == TRUE)
+
+selection_peptides <- selection_limma$peptide
+
+#attach protein limma information
+#selection_limma <- left_join(selection_limma, protein_limma_IKIG, by = c("Uniprot" = "Protein.Group"))
+
+
+selection_mat_z <- t(scale(t(peptides_mat_semi_30inIK[selection_peptides,sample_ids_IKIG]), center = TRUE, scale = TRUE))
+
+for_heat_subset <- selection_mat_z[selection_peptides,]
+#112 peptides of 76 different proteins
+
+selection_info <- data.frame(Stripped.Sequence = rownames(selection_mat_z))
+
+selection_info <- left_join(selection_info, pep2prot2gene)
+
+#make a vector with gene names and aa positions
+aa_positions <- gsub(".*(\\(.*\\))", "\\1", selection_info$Protein.Ids)
+genes_aa <- paste(selection_info$Genes, aa_positions)
+
+rownames(for_heat_subset) <- genes_aa
+
+#rotate 
+for_heat_subset_t <- t(for_heat_subset)
+type_fil_IKIG_name <- type_fil_IKIG
+
+type_fil_IKIG_name <- str_replace(type_fil_IKIG_name, "IK", "Peri-\nimplantitis") 
+type_fil_IKIG_name <- str_replace(type_fil_IKIG_name, "IG", "Healthy\nimplant") 
+
+type_fil_IKIG_name <- factor(type_fil_IKIG_name,
+                                         levels = c("Peri-\nimplantitis", "Healthy\nimplant"))
+
+###
+###
+#add protein information
+
+#ECRegion 
+ExtraRegion <- read_excel("uniprotkb_GO_0005576_ExtracellularRegion.xlsx")
+
+selection_info <- selection_info %>%
+  mutate(ECRegion = ifelse(Uniprot %in% ExtraRegion$Entry, "yes", "no"))
+
+selection_info$ECRegion <- str_replace(selection_info$ECRegion, "yes", "Extracellular\nregion")
+
+#Immune System Process
+GO_ImmSysProc <- read_excel("GO_ImmSysProc.xlsx")
+GO_ImmSysProc <- unique(GO_ImmSysProc$`2`)
+
+selection_info <- selection_info %>%
+   mutate(GO_ImmSysProc = ifelse(Uniprot %in% GO_ImmSysProc, "yes", "no"))
+
+selection_info$GO_ImmSysProc <- str_replace(selection_info$GO_ImmSysProc, "yes", "Immune system\nprocess")
+
+#Granule
+GO_azugranule <- read_excel("GO_AzuGranule.xlsx")
+GO_azugranule <- GO_azugranule$`2`
+
+GO_secgranule <- read_excel("GO_SecGranule.xlsx")
+GO_secgranule <- GO_secgranule$`2`
+
+GO_tertgranule <- read_excel("GO_TertGranule.xlsx")
+GO_tertgranule <- GO_tertgranule$`2`
+
+selection_info <- selection_info %>%
+  mutate(AzuGranule = ifelse(Uniprot %in% GO_azugranule, "yes", "no"),
+         SecGranule = ifelse(Uniprot %in% GO_secgranule, "yes", "no"),
+         TertGranule = ifelse(Uniprot %in% GO_tertgranule, "yes", "no"))
+
+selection_info <- selection_info %>%
+  mutate(Granule = ifelse(AzuGranule == "yes" | SecGranule == "yes" | TertGranule == "yes", "Neutrophil\ngranule", "no"))
+
+#sample annot
+annot_row <- rowAnnotation(
+  Condition = type_fil_IKIG_name,
+  col = list(Condition = c("Peri-\nimplantitis"="#c44826","Healthy\nimplant"="#5d7034")),
+  show_legend = TRUE,
+  annotation_name_gp = gpar(fontsize = 1),
+  annotation_legend_param = list(labels_gp = gpar(fontsize = 5),
+                                 title_gp = gpar(fontsize = 5, fontface = "bold"),
+                                 grid_width = unit(0.2, "cm"),
+                                 grid_height = unit(0.2, "cm")),
+  simple_anno_size = unit(0.2, "cm"))
+
+
+#protein annot
+annot_cols <- HeatmapAnnotation(
+  `Extracellular region` = selection_info$ECRegion,
+  `Immune system process` = selection_info$GO_ImmSysProc,
+  `Neutrophil granule` = selection_info$Granule,
+  col = list(`Extracellular region` = c("Extracellular\nregion" = "#7fbc41",
+                           "no" = "white"),
+             `Immune system process` = c("Immune system\nprocess" = "#c51b7d",
+                                         "no" = "white"),
+             `Neutrophil granule`= c("Neutrophil\ngranule" = "#35978f", 
+                                     "no" = "white")),
+  gp = gpar(col = "white"),
+  annotation_name_gp = gpar(fontsize = 1),
+  annotation_legend_param = list(labels_gp = gpar(fontsize = 5),
+                                 title_gp = gpar(fontsize = 5),
+                                 grid_width = unit(0.2, "cm"),
+                                 grid_height = unit(0.2, "cm")),
+  simple_anno_size = unit(0.1, "cm"))
+
+panel_colors <- colorRamp2(c(-3.5, -1.0, -0.5, 0, 0.5, 1.0, 3.5),
+                             c("#134688",
+                               "#74add1",  
+                               "#abd9e9",
+                               "white",
+                               "#fdae61",
+                               "#f46d43",
+                               "#a50026"))
+
+#make the heatmap
+heatmap_obj <- Heatmap(
+  for_heat_subset_t,
+  cluster_columns = TRUE,
+  cluster_rows = TRUE,
+  show_row_names = FALSE, 
+  show_column_names = TRUE,
+  column_names_gp = gpar(fontsize = 3, angle = 90), #font 4 or 5
+  row_names_gp = gpar(fontsize = 5),
+  column_names_side = "bottom",
+  show_row_dend = TRUE,
+  row_dend_width = unit(0.5, "cm"),
+  column_dend_height = unit(0.5, "cm"),
+  show_column_dend = TRUE,
+  heatmap_legend_param = list(title = "Z-score",
+                              labels_gp = gpar(fontsize = 5),
+                              title_gp = gpar(fontsize = 5, fontface = "bold"),
+                              grid_width = unit(0.2, "cm")),
+  column_title_gp = gpar(fontsize = 5, fontface = "bold"),
+  row_title_gp = gpar(fontsize = 5, fontface = "bold"),
+  row_split = 2,
+  row_title = "Samples",
+  col = panel_colors,
+  column_split = 2,
+  column_title = "Semi-specific peptides",
+  bottom_annotation = annot_cols,
+  right_annotation = annot_row)
+
+draw(heatmap_obj)
+```
+#cleavage pattern of sig diff abundanct peptides
+```{r}
+selection_up <- selection_limma$peptide[selection_limma$logFC > 0]
+selection_down <- selection_limma$peptide[selection_limma$logFC < 0]
+
+selection_up_cleavage <- annotated_peptides$cleavage_sequence[annotated_peptides$peptide %in% selection_up]
+selection_down_cleavage <- annotated_peptides$cleavage_sequence[annotated_peptides$peptide %in% selection_down]
+
+selection_up_heat <- cleavage_area_matrix(
+  selection_up_cleavage, 
+  p_number = 5)
+
+selection_down_heat <- cleavage_area_matrix(
+  selection_down_cleavage, 
+  p_number = 5)
+
+#plot
+heatmap_data <- as.data.frame(selection_up_heat$amino_acid_count) %>%
+  rownames_to_column(var = "Row") %>%
+  pivot_longer(-Row, names_to = "Column", values_to = "Value") %>%
+  mutate(Row = factor(Row, levels = sort(unique(Row), decreasing = TRUE)))
+
+heatmap_data$Column <- factor(heatmap_data$Column,
+                                 levels = c("P5", "P4", "P3", "P2",  "P1",
+                                            "P1'", "P2'", "P3'", "P4'", "P5'"))
+
+heatmap_data <- heatmap_data %>%
+  filter(Row != "X")
+
+# Create the heatmap with ggplot
+ggplot(heatmap_data, aes(x = Column, y = Row, fill = Value)) +
+  geom_tile(color = "white") +
+  scale_fill_gradientn(colors = colorRampPalette(brewer.pal(n = 9, name = "Greys"))(100)) +
+  theme_minimal() +
+  labs(fill = "Counts", x = "Position", y = "Amino acid") +
+  theme_manuscript +
+  theme(axis.title.x = element_text(size = 10, color = "black", face = "bold", margin = margin(t = 0)),
+        axis.title.y = element_text(size = 10, color = "black", face = "bold", margin = margin(r = 0)),
+        legend.position = "right",
+        legend.title = element_text(size = 10, color = "black", face = "bold"))
+
+```
+
+

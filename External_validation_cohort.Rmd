@@ -1,0 +1,856 @@
+### Analysis of External Validation Cohort ###
+#by AT
+
+#load libraries
+```{r}
+library(devtools)
+library(diann)
+library(tidyverse)
+library(ggplot2)
+library(ggrepel)
+library(ggpubr)
+library(dplyr)
+library(tidyr)
+library(visdat)
+library("readxl")
+library(RColorBrewer)
+library(mixOmics)
+library(limma)
+library(clusterProfiler)
+library(enrichplot)
+library(org.Hs.eg.db)
+library("ComplexHeatmap")
+library(colorRamp2)
+library(HarmonizR)
+library(genefilter)
+library(edgeR)
+library(sva)
+library(arrow)
+library(UniprotR)
+library(ggvenn)
+library(TOSTER)
+library(broom)
+library(umap)
+library(vegan)
+library(gtsummary)
+library(xgboost)
+library(caret)
+library(pROC)
+library(ROCR)
+library(ROSE)
+library(dplyr)
+library(rBayesianOptimization)
+library(parallel)
+library(doParallel)
+```
+#colors and ggplot theme
+```{r}
+new_colors <- list(
+  values = c("IK" = "#c44826", "IG" = "#5d7034", "ZG" = "#7da4b7"),
+  labels = c("IK" = "peri-implantitis", "IG" = "healthy implant", "ZG" = "healthy tooth")
+)
+
+
+theme_manuscript <- theme(
+        axis.text = element_text(size = 10, color = "black"),
+        axis.title.x = element_text(size = 10, color = "black", face = "bold", margin = margin(t = 0)),
+        axis.title.y = element_text(size = 10, color = "black", face = "bold", margin = margin(r = 0)),
+        strip.text = element_text(size = 10, color = "black", face = "bold"),
+        strip.background = element_rect(fill = "white"),
+        legend.text = element_text(size = 10, color = "black"),
+        legend.title = element_blank(),
+        panel.background = element_blank(),
+        panel.grid.major = element_line(color = "white"),
+        panel.border = element_rect(colour = "black", 
+                                    fill = NA, 
+                                    linewidth = 1),
+        legend.spacing.y = unit(0.5, "cm"),
+        legend.position = "none")
+```
+#load raw data
+```{r}
+diann_parquet <- "report.parquet"
+data_raw <- arrow::read_parquet(diann_parquet)
+
+#adjust the column "Run" to "File.Name", otherwise diann_matrix() won't work
+names(data_raw)[names(data_raw) == 'Run'] <- 'File.Name'
+
+#filter q-values
+data_raw_fil <- data_raw %>%
+  filter(data_raw$Lib.PG.Q.Value <= 0.01 &
+           data_raw$Lib.Q.Value <= 0.01 &
+           data_raw$Q.Value <= 0.01)
+
+#save maxLFQ values in matrix
+prot_mat <- diann_matrix(data_raw_fil, 
+                         id.header = "Protein.Group", 
+                         quantity.header = "PG.MaxLFQ", 
+                         proteotypic.only = F)
+
+
+#create matrix with uniprot ids ans gene ids
+prot2gene <- data_raw_fil[,c(13,15)]
+prot2gene <- distinct(prot2gene, Protein.Group, Genes, .keep_all = TRUE)
+
+#load annotation file
+annot_data <- read_excel("Annotations_external_validation_cohort.xlsx")
+```
+#preprocessing
+```{r}
+#remove iRTs and nonendogenous contaminants
+prot_mat <- prot_mat[!grepl("^Biognosys", rownames(prot_mat)), ]
+prot_mat <- prot_mat[!grepl("^contam", rownames(prot_mat)), ]
+
+#log2 and save as data frame
+prot_mat <- log2(prot_mat)
+prot_mat <- as.data.frame(prot_mat)
+
+#adjust colnames
+sample_ids <- colnames(prot_mat)
+sample_ids <- substr(sample_ids, 1, 5)
+colnames(prot_mat) <- sample_ids
+
+#check coverage of protein IDs
+covplot_prot_mat <- data.frame(sample_id = colnames(prot_mat),
+                        id_count = colSums(!is.na(prot_mat)),
+                        counter = 1:ncol(prot_mat))
+
+covplot_prot_mat <- left_join(covplot_prot_mat, annot_data)
+
+ggplot(covplot_prot_mat, aes(x = reorder(sample_id, id_count), y = id_count)) +
+  geom_col(aes(fill = type), color = "black", size = 0.1) +
+  labs(y = "Protein IDs", x = "Samples") +
+  geom_text(aes(label = sample_id), y = 100, vjust = 0.5, size = 2, angle = 90) +
+  geom_text(aes(label = id_count), vjust = 0.5, hjust = -0.1, size = 2, angle = 90) +
+  theme(
+    axis.text.x = element_blank(),
+    axis.ticks.x = element_blank(),
+    strip.background = element_blank(),
+    strip.text = element_blank(),
+    axis.text = element_text(size = 15, color = "black"),
+    axis.title = element_text(size = 15, color = "black", face = "bold"),
+    axis.ticks.y = element_line(linewidth = 0.1, color ="black"),
+    panel.grid = element_line(linewidth = 0.1)) +
+  scale_fill_manual(values = new_colors$values, 
+                    labels = new_colors$labels)
+
+sample_ids_fil <- annot_data$sample_id
+
+covplot_prot_mat_fil <- covplot_prot_mat %>%
+  filter(sample_id %in% sample_ids_fil)
+
+annot_data_fil <- annot_data %>%
+  filter(sample_id %in% sample_ids_fil)
+
+#add column with protein IDs to annotation file
+annot_data_fil <- left_join(annot_data_fil, covplot_prot_mat_fil)
+
+#save vector with sample type for later
+type_fil <- annot_data_fil$type
+
+#remove from prot_mat
+prot_mat_fil <- prot_mat[,sample_ids_fil]
+#remove rows with only NAs
+prot_mat_fil <- prot_mat_fil[!apply(prot_mat_fil, 1, function(x) all(is.na(x))), ]
+
+#save
+write.csv(prot_mat_fil, "prot_mat_fil_external_validation.csv")
+write.csv(annot_data_fil, "annot_data_fil_external_validation.csv")
+```
+#boxplot of protein IDs per type
+```{r}
+covplot_prot_mat_fil$type_name <- covplot_prot_mat_fil$type
+
+covplot_prot_mat_fil$type_name <- str_replace(covplot_prot_mat_fil$type_name, "IK", "Peri-\nimplantitis") 
+covplot_prot_mat_fil$type_name <- str_replace(covplot_prot_mat_fil$type_name, "IG", "Healthy\nimplant") 
+covplot_prot_mat_fil$type_name <- str_replace(covplot_prot_mat_fil$type_name, "ZG", "Healthy\ntooth") 
+
+covplot_prot_mat_fil$type_name <- factor(covplot_prot_mat_fil$type_name,
+                                         levels = c("Peri-\nimplantitis", "Healthy\nimplant", "Healthy\ntooth"))
+
+#perform pairwise t-tests between the three types
+pairwise_result <- pairwise.t.test(annot_data_fil$id_count, annot_data_fil$type, p.adjust.method = "bonferroni")
+#view the results
+print(pairwise_result)
+#no p-value <= 0.05 -> not significantly different protein IDs
+
+ggplot(covplot_prot_mat_fil, aes(type_name, id_count)) +
+  geom_violin(aes(fill = type), alpha = 0.9) +
+  geom_boxplot(width = .1, lwd = 0.5, aes(fill = type)) +
+  geom_bracket(xmin = 1, xmax = 3, y.position = 6150, 
+               label = "ns", size = 0.5, label.size = 4) +
+  geom_bracket(xmin = 1, xmax = 2, y.position = 6150, 
+               label = "", size = 0.5) +
+  labs(x = "", y = "Protein IDs") +
+  scale_y_continuous(limits = c(3900, 6300),
+                     breaks = c(4000, 5000, 6000)) +
+  theme_manuscript +
+  scale_fill_manual(values = new_colors$values, labels = new_colors$labels)
+```
+#boxplot of log2 intensities
+```{r}
+prot_mat_fil_long <- pivot_longer(prot_mat_fil, cols=1:length(prot_mat_fil), names_to = "sample_id", values_to = "abundance")
+
+ggplot(data = prot_mat_fil_long, aes(sample_id, abundance)) +
+  geom_boxplot() +
+  labs(y = "log2 intensity", x = "") +
+  theme(axis.text.x = element_text(size = 7, angle = 90, vjust = 0.3),
+        axis.text.y = element_text(size = 7),
+        axis.title = element_text(size = 10, face = "bold"))
+```
+#check correlation of NAs and medians
+```{r}
+NAvsmeans_plot_data <- data.frame(mean = colMeans(prot_mat_fil, na.rm = TRUE),
+                                  missing_values = colSums(is.na(prot_mat_fil)))
+
+ggplot(NAvsmeans_plot_data, aes(x = missing_values, y = mean)) +
+  geom_point() +
+  geom_smooth(method = "lm", se = FALSE, color = "black") +
+  labs(x = "Number of missing values",
+       y = "Mean log2 intensity") +
+  theme(axis.text = element_text(size = 15, color = "black"),
+        axis.title = element_text(size = 20, color = "black", face = "bold"),
+        strip.text = element_text(size = 20, color = "black", face = "bold"),
+        legend.text = element_text(size = 15, color = "black"),
+        legend.title = element_blank(),
+        panel.background = element_rect(color="grey"),
+        panel.grid.major = element_line(color = "white"),
+        panel.border = element_rect(colour = "white", 
+                                    fill = NA, 
+                                    size = 0.5),
+        plot.title = element_text(hjust = 0.5, face = "bold"),
+        legend.spacing.y = unit(0.5, "cm"),
+        legend.position = "none")
+
+#positive correlation -> no normalization necessary
+```
+#missingness plot
+```{r}
+vis_miss(prot_mat_fil, warn_large_data = FALSE)+
+  theme(
+    axis.text.x = element_text(size = 3, angle = 90)
+  )
+```
+#make missingness_df for sparsity reduction 
+```{r}
+#filtering dependent on conditions
+conditions <- unique(type_fil)
+
+#create an empty data frame to store the results
+missingness_df <- data.frame(matrix(NA,
+                                    nrow = nrow(prot_mat_fil),
+                                    ncol = length(conditions)))
+colnames(missingness_df) <- conditions
+
+#iterate over each condition
+for (condition in conditions) {
+  #subset samples based on the current condition
+  samples <- annot_data_fil$sample_id[annot_data_fil$type == condition]
+  #calculate missingness for the current condition
+  missingness <- rowSums(is.na(prot_mat_fil[, samples])) / length(samples)
+  #filter rows based on missingness threshold
+  missingness_df[, condition] <- missingness
+}
+
+missingness_df$protein <- rownames(prot_mat_fil)
+
+```
+#ranked abundance plot - per sample type
+```{r}
+#one for each condition 
+#proteins counted as identified when missingness <= 30%
+sample_ids_IK <- annot_data_fil$sample_id[annot_data_fil$type == "IK"]
+sample_ids_IG <- annot_data_fil$sample_id[annot_data_fil$type == "IG"]
+sample_ids_ZG <- annot_data_fil$sample_id[annot_data_fil$type == "ZG"]
+
+#calculate the median for each protein of all samples of the same type
+#IK
+#rows in prot_mat_fil with <= 30% missingness 
+rows_30NA_IK <- which(missingness_df$IK <= 0.3)
+#save those 
+temp_IK <- prot_mat_fil[rows_30NA_IK,sample_ids_IK]
+#calculate the median
+temp_IK$median <- apply(temp_IK, 1, median, na.rm = TRUE)
+temp_IK$median_raw <- 2^temp_IK$median
+temp_IK <- temp_IK %>%
+  arrange(desc(median)) %>%
+  mutate(rank = row_number())
+temp_IK$rank_perc <- temp_IK$rank/nrow(temp_IK)
+
+temp_IK <- temp_IK %>%
+  rownames_to_column("Protein.Group")
+
+temp_IK <- left_join(temp_IK, prot2gene)
+
+
+#same for IG
+rows_30NA_IG <- which(missingness_df$IG <= 0.3)
+#save those 
+temp_IG <- prot_mat_fil[rows_30NA_IG,sample_ids_IG]
+#calculate the median
+temp_IG$median <- apply(temp_IG, 1, median, na.rm = TRUE)
+temp_IG$median_raw <- 2^temp_IG$median
+temp_IG <- temp_IG %>%
+  arrange(desc(median)) %>%
+  mutate(rank = row_number())
+temp_IG$rank_perc <- temp_IG$rank/nrow(temp_IG)
+
+temp_IG <- temp_IG %>%
+  rownames_to_column("Protein.Group")
+
+temp_IG <- left_join(temp_IG, prot2gene)
+
+
+#same for ZG
+rows_30NA_ZG <- which(missingness_df$ZG <= 0.3)
+#save those 
+temp_ZG <- prot_mat_fil[rows_30NA_ZG,sample_ids_ZG]
+#calculate the median
+temp_ZG$median <- apply(temp_ZG, 1, median, na.rm = TRUE)
+temp_ZG$median_raw <- 2^temp_ZG$median
+temp_ZG <- temp_ZG %>%
+  arrange(desc(median)) %>%
+  mutate(rank = row_number())
+temp_ZG$rank_perc <- temp_ZG$rank/nrow(temp_ZG)
+
+temp_ZG <- temp_ZG %>%
+  rownames_to_column("Protein.Group")
+
+temp_ZG <- left_join(temp_ZG, prot2gene)
+
+
+#for labeling
+label_histones <- c("H2BC11;H2BC21", "H4C16", "H3-7", "H2BC13", "H2AX")
+label_s100 <- c("S100A8", "S100A9")
+label_granule <- c("MPO", "AZU1", "CTSG", "LYZ", "DEFA3", "ELANE", "PRTN3")
+
+temp_IK$Genes_short <- temp_IK$Genes
+temp_IK$Genes_short <- str_replace(temp_IK$Genes_short, "H2BC11;H2BC21", "H2BC11") 
+
+ggplot(temp_IK, aes(x = rank_perc, y = log10(median_raw))) +
+  geom_point(color = "#c44826", size = 0.3) +
+  labs(x = "Rank", y = "Log10 intensity") + 
+  theme_manuscript +
+  theme(axis.text.x = element_blank(),
+        axis.ticks.x = element_blank()) +
+  xlim(0,1) +
+  scale_y_continuous(limits = c(2.6,7), breaks = c(3,5,7)) +
+  geom_label_repel(aes(label = ifelse(Genes %in% label_granule, as.character(Genes), ''),
+                      segment.color = "#c44826", segment.alpha = 0.5),
+                  max.overlaps = Inf, hjust = "right", nudge_x = 0.97, nudge_y = -1.3, box.padding = 0.05,
+                  direction = "y", color = "#c44826", size = 3.5, fill = "white") +
+  geom_label_repel(aes(label = ifelse(Genes %in% label_s100, as.character(Genes), ''),
+                      segment.color = "#c44826", segment.alpha = 0.5),
+                  max.overlaps = Inf, hjust = "right", nudge_x = 0.75, nudge_y = -0.3, box.padding = 0.05,
+                  direction = "y", color = "#c44826", size = 3.5) +
+  geom_label_repel(aes(label = ifelse(Genes %in% label_histones, as.character(Genes_short), ''),
+                      segment.color = "#c44826", segment.alpha = 0.5),
+                  max.overlaps = Inf, hjust = "right", nudge_x = 0.45, nudge_y = -0.5, box.padding = 0.05,
+                  direction = "y", color = "#c44826", size = 3.5) +
+  geom_label_repel(aes(label = ifelse(Genes == "ALB", as.character(Genes_short), ''),
+                      segment.color = "#c44826", segment.alpha = 0.5), min.segment.length = 0,
+                  max.overlaps = Inf, hjust = "right", nudge_x = 0.15, nudge_y = +0, box.padding = 0.05,
+                  direction = "y", color = "#c44826", size = 3.5)
+
+temp_IG$Genes_short <- temp_IG$Genes
+temp_IG$Genes_short <- str_replace(temp_IG$Genes_short, "H2BC11;H2BC21", "H2BC11") 
+
+ggplot(temp_IG, aes(x = rank_perc, y = log10(median_raw))) +
+  geom_point(color = "#5d7034", size = 0.3) +
+  labs(x = "Rank", y = "Log10 intensity") + 
+  theme_manuscript +
+  theme(axis.text.x = element_blank(),
+        axis.ticks.x = element_blank()) +
+  xlim(0,1) +
+  scale_y_continuous(limits = c(2.6,7)) +
+  geom_label_repel(aes(label = ifelse(Genes %in% label_granule, as.character(Genes), ''),
+                      segment.color = "#5d7034", segment.alpha = 0.5),
+                  max.overlaps = Inf, hjust = "right", nudge_x = 0.97, nudge_y = -1.1, box.padding = 0.05,
+                  direction = "y", color = "#5d7034", size = 3.5, fill = "white") +
+  geom_label_repel(aes(label = ifelse(Genes %in% label_s100, as.character(Genes), ''),
+                      segment.color = "#5d7034", segment.alpha = 0.5),
+                  max.overlaps = Inf, hjust = "right", nudge_x = 0.75, nudge_y = -0.3, box.padding = 0.05,
+                  direction = "y", color = "#5d7034", size = 3.5) +
+  geom_label_repel(aes(label = ifelse(Genes %in% label_histones, as.character(Genes_short), ''),
+                      segment.color = "#5d7034", segment.alpha = 0.5),
+                  max.overlaps = Inf, hjust = "right", nudge_x = 0.45, nudge_y = -0.5, box.padding = 0.05,
+                  direction = "y", color = "#5d7034", size = 3.5) +
+  geom_label_repel(aes(label = ifelse(Genes == "ALB", as.character(Genes_short), ''),
+                      segment.color = "#5d7034", segment.alpha = 0.5), min.segment.length = 0,
+                  max.overlaps = Inf, hjust = "right", nudge_x = 0.19, nudge_y = +0.1, box.padding = 0.05,
+                  direction = "y", color = "#5d7034", size = 3.5)
+
+temp_ZG$Genes_short <- temp_ZG$Genes
+temp_ZG$Genes_short <- str_replace(temp_ZG$Genes_short, "H2BC11;H2BC21", "H2BC11") 
+
+ggplot(temp_ZG, aes(x = rank_perc, y = log10(median_raw))) +
+  geom_point(color = "#7da4b7", size = 0.3) +
+  labs(x = "Rank", y = "Log10 intensity") + 
+  theme_manuscript +
+  theme(axis.text.x = element_blank(),
+        axis.ticks.x = element_blank()) +
+  xlim(0,1) +
+  scale_y_continuous(limits = c(2.6,7), breaks = c(3,5,7)) +
+  geom_label_repel(aes(label = ifelse(Genes %in% label_granule, as.character(Genes), ''),
+                      segment.color = "#7da4b7", segment.alpha = 0.5),
+                  max.overlaps = Inf, hjust = "right", nudge_x = 0.97, nudge_y = -1.2, box.padding = 0.05,
+                  direction = "y", color = "#7da4b7", size = 3.5, fill = "white") +
+  geom_label_repel(aes(label = ifelse(Genes %in% label_s100, as.character(Genes), ''),
+                      segment.color = "#7da4b7", segment.alpha = 0.5),
+                  max.overlaps = Inf, hjust = "right", nudge_x = 0.75, nudge_y = -0.2, box.padding = 0.05,
+                  direction = "y", color = "#7da4b7", size = 3.5) +
+  geom_label_repel(aes(label = ifelse(Genes %in% label_histones, as.character(Genes_short), ''),
+                      segment.color = "#7da4b7", segment.alpha = 0.5),
+                  max.overlaps = Inf, hjust = "right", nudge_x = 0.46, nudge_y = -0.5, box.padding = 0.05,
+                  direction = "y", color = "#7da4b7", size = 3.5) +
+  geom_label_repel(aes(label = ifelse(Genes == "ALB", as.character(Genes_short), ''),
+                      segment.color = "#7da4b7", segment.alpha = 0.5), min.segment.length = 0,
+                  max.overlaps = Inf, hjust = "right", nudge_x = 0.18, nudge_y = +0.2, box.padding = 0.05,
+                  direction = "y", color = "#7da4b7", size = 3.5)
+```
+#now sparsity reduction to <= 30% NAs in all three conditions
+```{r}
+rows_30NA <- which(rowSums(missingness_df[,c(1:3)] <= 0.3) == ncol(missingness_df[,c(1:3)]))
+
+#subset the original matrix using the filtered rows
+prot_mat_fil_sparsred <- prot_mat_fil[rows_30NA, ]
+#4765 proteins remaining
+```
+#missingenss after sparsity reduction
+```{r}
+vis_miss(prot_mat_fil_sparsred, warn_large_data = FALSE)+
+  theme(
+    axis.text.x = element_text(size = 3, angle = 90)
+  )
+```
+#PCA - IK, IG, ZG
+```{r}
+pca1 <- mixOmics::pca(t(prot_mat_fil_sparsred), 
+              ncomp = 2, 
+              center = TRUE, 
+              scale = TRUE)
+
+pca1_variates <- pca1$variates$X %>% 
+  as.data.frame() %>%
+  rownames_to_column("sample_id")
+
+pca1_variates <- left_join(pca1_variates, annot_data_fil)
+
+pca1_variates$type <- factor(pca1_variates$type, levels = c("ZG", "IG", "IK"))
+
+#manuscript format
+ggplot(data = pca1_variates,
+       aes(x = PC1, 
+           y = PC2,
+           group = type)) +
+  stat_ellipse(aes(color = type), size = 0.9, type = "t", level = 0.95) +
+  geom_jitter(size = 1, aes(color = type)) +  
+  xlab(paste("PC1", round(pca1$prop_expl_var$X[1]*100), "% expl. var.")) + 
+  ylab(paste("PC2", round(pca1$prop_expl_var$X[2]*100), "% expl. var.")) + 
+  scale_y_continuous(breaks = c(-30, 0, 30)) +
+  theme_manuscript +
+  theme(legend.position = "right") +
+  guides(color = guide_legend(byrow = TRUE)) +
+  scale_color_manual(values = new_colors$values, labels = new_colors$labels)
+```
+#PLSDA - IK, IG, ZG
+```{r}
+plsda1 <- mixOmics::plsda(X = t(prot_mat_fil_sparsred),
+                Y = type_fil,
+                ncomp = 2)
+
+plsda_variates <- plsda1$variates$X %>% 
+  as.data.frame() %>%
+  rownames_to_column("sample_id")
+
+plsda_variates <- left_join(plsda_variates, annot_data_fil)
+
+plsda_variates$type <- factor(plsda_variates$type, levels = c("ZG", "IG", "IK"))
+
+ggplot(data = plsda_variates,
+       aes(x = comp1, 
+           y = comp2,
+           group = type)) +
+  stat_ellipse(aes(color = type), size = 0.9, type = "t", level = 0.95) +
+  geom_jitter(size = 2, aes(color = type)) +  
+  xlab(paste("X-variate 1:", round(plsda1$prop_expl_var$X[1]*100), "% expl. var.")) + 
+  ylab(paste("X-variate 2:", round(plsda1$prop_expl_var$X[2]*100), "% expl. var.")) + 
+  theme_manuscript +
+  theme(legend.position = "right") +
+  guides(color = guide_legend(byrow = TRUE)) +
+  scale_color_manual(values = new_colors$values, labels = new_colors$labels)
+```
+#Patient-matched multi limma
+```{r}
+patients_fil <- annot_data_fil$patient_id
+
+design_multi_matched <- model.matrix(~0+type_fil)
+
+row.names(design_multi_matched) <- colnames(prot_mat_fil_sparsred)
+colnames(design_multi_matched) <- colnames(design_multi_matched) %>% str_remove(., "type_fil") %>% str_trim()
+
+# define contrasts
+contrast.matrix2 <- makeContrasts(IKvIG = IK-IG,
+                                  IKvZG = IK-ZG,
+                                  IGvZG = IG-ZG,
+                                 levels = design_multi_matched)
+
+n_contrasts <- dim(contrast.matrix2)[2]
+
+# run limma
+fit <- lmFit(prot_mat_fil_sparsred, 
+             design = design_multi_matched,
+             method = "robust", 
+             block = patients_fil)
+
+fit2 <- contrasts.fit(fit, 
+                      contrast.matrix2)
+
+fit2 <- eBayes(fit2)
+
+output_limma <- topTable(fit2, adjust.method = "BH", number = Inf)
+
+output_limma$Protein.Group <- row.names(output_limma)
+
+#generate output list
+list_tabular <- list()
+
+for (i in 1:n_contrasts){
+  outlim <- topTable(fit2, coef = i, adjust.method = "BH", number = Inf)
+  outlim$Protein.Group <- row.names(outlim)
+  outlim$Contrast <- colnames(contrast.matrix2)[i]
+  list_tabular[[i]] <- outlim
+}
+
+names(list_tabular) <- colnames(contrast.matrix2)
+
+merged_limma <- reshape::merge_all(list_tabular)
+
+merged_limma <- left_join(merged_limma, prot2gene)
+
+merged_limma <- merged_limma %>%
+  mutate(Differentially_expressed = case_when(adj.P.Val <= 0.05 ~ TRUE, TRUE ~ FALSE)) 
+
+merged_limma <- merged_limma %>%
+  mutate(plot_col_05 = case_when(adj.P.Val <= 0.05 & logFC > 0 ~ "up",
+                              adj.P.Val <= 0.05 & logFC < 0 ~ "down",
+                              adj.P.Val > 0.05 ~ "none"))
+
+limma_all3 <- merged_limma
+
+#plot_col for adj. p-value cutoff of 0.05
+limma_all3 <- limma_all3 %>%
+  mutate(plot_col_05_contrast = paste(Contrast, plot_col_05, sep = "+"))
+
+limma_all3$Contrast <- factor(limma_all3$Contrast, levels = c("IKvIG", "IKvZG", "IGvZG"))
+
+#plot
+ggplot(data = limma_all3, 
+       mapping = aes(x = logFC,
+                     y = -log10(adj.P.Val),
+                     color = plot_col_05_contrast)) + 
+  geom_point(size = 1) + 
+  facet_grid(. ~ Contrast) +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed", color = "gray20", size = 0.5) +
+  labs(y="-log10(adj. p-value)") + 
+  theme_manuscript +
+  theme(strip.background = element_blank(),
+        legend.position = "none") +
+  scale_color_manual(values = c("IGvZG+up" = "#5d7034",
+                                "IGvZG+down" = "#7da4b7",
+                                "IGvZG+none" = "gray40",
+                                "IKvIG+up" = "#c44826",
+                                "IKvIG+down" = "#5d7034",
+                                "IKvIG+none" = "gray40",
+                                "IKvZG+up" = "#c44826",
+                                "IKvZG+down" = "#7da4b7",
+                                "IKvZG+none" = "gray40"))
+
+write.csv(limma_all3, "limma_IK_IG_ZG_external_validation_cohort.csv")
+
+```
+#validation of biomarker candidates
+```{r}
+overlap_08prots <- read.csv("overlap_08prots.csv", row.names = 1)
+overlap_08prots <- overlap_08prots$x
+
+#which of these 80 have a p-valu >= 0.05 in limma of 2025
+prots_confirmed <- limma_all3 %>%
+  filter(Contrast == "IKvIG") %>%
+  filter(Protein.Group %in% overlap_08prots) %>%
+  filter(P.Value <= 0.05)
+prots_confirmed <- prots_confirmed$Protein.Group
+#37 proteins
+```
+#prepare matrix for classification model training
+```{r}
+#transpose protein matrix after sample filtering but without normalization/scaling
+classifier_mat <- as.data.frame(t(prot_mat_fil))
+
+classifier_mat <- classifier_mat %>%
+  rownames_to_column("sample_id")
+
+classifier_mat$type <- annot_data_fil$type
+
+#remove all ZG samples
+classifier_mat <- classifier_mat %>%
+  filter(type != "ZG") %>%
+  column_to_rownames("sample_id")
+
+classifier_mat$type <- factor(classifier_mat$type, levels = c("IG", "IK"))
+
+#need to remove the ; in the column names of the classifier_mat3
+cols_mat <- colnames(classifier_mat)
+cols_mat_mod <- sub(";.*", "", cols_mat)
+
+classifier_mat_mod <- classifier_mat
+colnames(classifier_mat_mod) <- cols_mat_mod
+
+#selection of features
+prots_selection_mod <- sub(";.*", "", prots_confirmed)
+```
+#model training - functions
+```{r}
+prep_df <- function(classifier_mat, prots_selection){
+  data_t <- classifier_mat[,colnames(classifier_mat) %in% prots_selection]
+  data_t$type <- classifier_mat$type
+  data_t$type <- factor(data_t$type, levels = c("IG", "IK"))
+  return(data_t)
+}
+
+#bayesian optimization with 5-fold cross-validation
+xgb_cv_bayes <- function(eta, max_depth, subsample, colsample_bytree, min_child_weight, gamma, alpha, lambda) {
+  
+  tryCatch({
+    dtrain <- xgb.DMatrix(data = as.matrix(training[, -ncol(training)]), 
+                          label = as.numeric(training$type) - 1)
+    
+    params <- list(
+      booster = "gbtree",
+      objective = "binary:logistic",
+      eval_metric = "auc",
+      eta = eta,
+      max_depth = max_depth,
+      subsample = subsample,
+      colsample_bytree = colsample_bytree,
+      min_child_weight = min_child_weight,
+      gamma = gamma,
+      alpha = alpha,
+      lambda = lambda
+    )
+    
+    cv_result <- xgb.cv(
+      params = params,
+      data = dtrain,
+      nrounds = 1000,
+      nfold = 5,
+      early_stopping_rounds = 50,
+      verbose = 0,
+      nthread = 96,
+      stratified = TRUE
+    )
+    
+    score <- max(cv_result$evaluation_log$test_auc_mean, na.rm = TRUE)  # Ensure no NA values in the score
+    
+    return(list(Score = score, Pred = 0))
+    
+  }, error = function(e) {
+    message("Error during optimization step: ", e)  # Print the error message
+    return(list(Score = 0.5, Pred = 0))  # Assign a low score if an error occurs
+  })
+}
+
+#bayesian optimization function
+tune_xgboost_bayes <- function(training) {
+  set.seed(1234)
+  opt_res <- BayesianOptimization(
+    FUN = xgb_cv_bayes,
+    bounds = list(
+      eta = c(0.001, 0.2),
+      max_depth = c(2L, 4L),
+      subsample = c(0.8, 1.0),   
+      colsample_bytree = c(0.8, 1),
+      min_child_weight = c(2L, 10L),
+      gamma = c(0, 2), #bis 2 
+      alpha = c(0, 1),
+      lambda = c(1, 10) #bis 10 
+    ),
+    init_points = 5,
+    n_iter = 20,
+    acq = "ucb",
+    kappa = 2.576,
+    verbose = TRUE
+  )
+  
+  #extract the best hyperparameters
+  best_params <- list(
+    booster = "gbtree",
+    objective = "binary:logistic",
+    eval_metric = "auc",
+    eta = opt_res$Best_Par["eta"],
+    max_depth = as.integer(opt_res$Best_Par["max_depth"]),
+    subsample = opt_res$Best_Par["subsample"],
+    colsample_bytree = opt_res$Best_Par["colsample_bytree"],
+    min_child_weight = as.integer(opt_res$Best_Par["min_child_weight"]),
+    gamma = opt_res$Best_Par["gamma"],
+    alpha = opt_res$Best_Par["alpha"],
+    lambda = opt_res$Best_Par["lambda"],
+    nthread = 96
+  )
+  
+  return(best_params)
+}
+
+
+#train XGBoost model without early stopping
+train_xgboost_model <- function(training, params) {
+  #prepare the training data
+  dtrain <- xgb.DMatrix(data = as.matrix(training[, -ncol(training)]), 
+                        label = as.numeric(training$type) - 1)
+  
+  #train the model without early stopping and no validation set
+  model <- xgb.train(
+    params = params,
+    data = dtrain,
+    nrounds = 1000,  # The number of boosting rounds
+    verbose = 1  # Verbosity level
+  )
+  
+  return(model)
+}
+
+
+#evaluate model function
+evaluate_model <- function(model, test_data, prots_selection) {
+  #convert test data to DMatrix format for XGBoost
+  dtest <- xgb.DMatrix(data = as.matrix(test_data[, -ncol(test_data)]))
+  
+  #get predicted probabilities
+  pred_probs <- predict(model, dtest)
+  
+  #ensure that the length of predictions matches the number of actual labels
+  if (length(pred_probs) != nrow(test_data)) {
+    stop("Number of predictions does not match the number of rows in test_data.")
+  }
+  
+  #compute ROC to get the best threshold using Youden's index
+  roc_obj <- roc(response = as.numeric(test_data$type) - 1, predictor = pred_probs)
+  best_threshold <- coords(roc_obj, "best", ret = "threshold", best.method = "youden")
+  best_threshold <- best_threshold[1,1]
+  
+  #classify based on best threshold
+  pred_class <- ifelse(pred_probs > best_threshold, "IK", "IG")
+  
+  #convert predictions to factor with the same levels as test_data$type
+  pred_class <- factor(pred_class, levels = levels(test_data$type))
+  
+  #ensure that pred_class and test_data$type have the same length
+  if (length(pred_class) != length(test_data$type)) {
+    stop("The length of predicted classes does not match the actual classes.")
+  }
+  
+  #create confusion matrix
+  conf_matrix <- confusionMatrix(pred_class, test_data$type, positive = "IK")
+  
+  #return evaluation metrics
+  return(list(
+    Proteins = length(prots_selection),
+    Acc = conf_matrix$overall["Accuracy"],
+    Sens = conf_matrix$byClass["Sensitivity"],
+    Spec = conf_matrix$byClass["Specificity"],
+    AUC = auc(roc_obj),
+    Best_Threshold = best_threshold,
+    prots_selection = paste(prots_selection, collapse = ",")
+  ))
+}
+
+```
+#model training - execution
+```{r}
+#prepare data
+dataML <- prep_df(classifier_mat_mod, prots_selection_mod)
+
+#split data into training and testing
+set.seed(1234)
+inTrain <- createDataPartition(y = dataML$type, p = 0.70, list = FALSE)
+training <- dataML[inTrain,]
+testing <- dataML[-inTrain,]
+
+#perform bayesian optimization to tune hyperparameters using 5-fold CV
+#best_params <- tune_xgboost_bayes(training)
+best_params <- as.list(read.csv("best_params_external_validation_cohort.csv")[, -1])
+
+#train the final model with the best hyperparameters
+xgb_model <- train_xgboost_model(training, best_params)
+
+#evaluate the model on the test data
+result <- evaluate_model(xgb_model, testing, prots_selection_mod)
+
+#feature importance
+importance <- xgb.importance(feature_names = colnames(training)[-ncol(training)], 
+                             model = xgb_model)
+
+#print results
+results_df <- do.call(rbind, lapply(result, as.data.frame))
+
+
+
+#run code from function again to get the confusion matrix and ROC plot
+
+#convert test data to DMatrix format for XGBoost
+dtest <- xgb.DMatrix(data = as.matrix(testing[, -ncol(testing)]))
+  
+#get predicted probabilities
+pred_probs <- predict(xgb_model, dtest)
+  
+#compute ROC to get the best threshold using Youden's index
+roc_obj <- roc(response = as.numeric(testing$type) - 1, predictor = pred_probs)
+best_threshold <- coords(roc_obj, "best", ret = "threshold", best.method = "youden")
+best_threshold <- best_threshold[1,1]
+  
+#classify based on best threshold
+pred_class <- ifelse(pred_probs > best_threshold, "IK", "IG")
+pred_class <- factor(pred_class, levels = c("IG", "IK"))
+  
+#create confusion matrix
+conf_matrix <- confusionMatrix(pred_class, testing$type, positive = "IK")
+conf_matrix
+
+#          Reference
+#Prediction IG IK
+#        IG  5  1
+#        IK  1  5
+
+#ROC plot
+#create a data frame for ggplot
+roc_data <- data.frame(
+  Sens = roc_obj[["sensitivities"]],
+  Spec = roc_obj[["specificities"]]
+)
+roc_data$SpecNeg <- 1- roc_data$Spec
+
+roc_data <- roc_data[order(abs(roc_data$Sens), decreasing = FALSE), ]
+
+roc_data <- roc_data %>%
+  arrange(Sens, decreasing = FALSE)
+
+auc_value <- roc_obj[["auc"]]
+
+roc_data <- roc_data %>%
+  mutate(auc = auc_value)
+
+ggplot(roc_data, aes(x = SpecNeg, y = Sens)) +
+  geom_abline(slope = 1, intercept = 0, linetype = "solid", color = "gray40", size = 0.5) +
+  geom_line(color = "seagreen", size = 1) +
+  labs(x = "1 - Specificity",
+       y = "Sensitivity") +
+  xlim(0,1) +
+  ylim(0,1) +
+  theme_manuscript +
+  geom_text(aes(x = 0.80, y = 0.20, label = paste("AUC =", sprintf("%.2f", auc)), fontface = "bold"),
+            color = "seagreen", size = 4)
+```
+
+
+
+
